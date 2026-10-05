@@ -1,0 +1,114 @@
+import type { On } from 'claude-code'
+import { describe, expect, mock, test } from 'claude-code/testing'
+
+const NOW = Date.UTC(2026, 9, 5, 9, 0)
+const ROOT = '/home/dev/.agents/notes/acme-app/feat-sync'
+
+const PANE = {
+  component: 'Pane',
+  requestId: 'breadcrumbs',
+  props: {
+    title: 'breadcrumbs',
+    isFocused: false,
+    bodyColumns: 50,
+    placement: 'dock',
+    scroll: { offset: 0, bodyRows: 40 },
+    view: {},
+  },
+} as const
+
+const world = (on: On, reply = '{}') => {
+  const files = new Map<string, string>()
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { HOME: '/home/dev' })
+  mock.store(on)
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__breadcrumbs__${e.name}` } }))
+  on('session.id', () => ({ value: 'abc123def456' }))
+  on('session.cwd', () => ({ value: '/code/feat-sync' }))
+  on('session.repo', () => ({ value: { root: '/code/acme-app', remote: null, internal: false, name: null } }))
+  on('process.run', ($, e) => {
+    const out = e.argv.includes('--show-toplevel') ? '/code/feat-sync\n' : e.argv.includes('--show-current') ? 'feat/sync\n' : ''
+    return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('fs.write', ($, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.read', ($, e) => {
+    const text = files.get(e.path)
+    if (text === undefined) throw new Error(`ENOENT ${e.path}`)
+    return { value: text }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
+  on('model.complete', () => ({
+    value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+  }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+
+  return { files, clock }
+}
+
+describe('breadcrumbs', () => {
+  test('save_note writes a note file and the pane previews it', async ($, on) => {
+    const { files } = world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+
+    const saved = await $.tool.call({
+      tool: 'mcp__breadcrumbs__save_note',
+      title: 'Why the backoff raced',
+      markdown: 'Two timers both **reconnected**.',
+    })
+    expect(saved.deny).toBeUndefined()
+
+    const note = [...files.keys()].find(p => p.endsWith('01-why-the-backoff-raced.md'))
+    expect(note?.startsWith(`${ROOT}/2026-10-05-`)).toBe(true)
+    expect(files.get(note ?? '')).toContain('Two timers both **reconnected**.')
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface, ...PANE })
+      expect(await ui.find({ type: 'Button', text: /Why the backoff raced/ })).toBeDefined()
+      const row = await ui.find({ type: 'Button', text: /Why the backoff raced/ })
+      await ui.press({ key: row?.key ?? '' })
+      expect(await ui.find({ type: 'Markdown', text: /Two timers/ })).toBeDefined()
+      await ui.press({ key: 'close-note' })
+      expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
+      await ui.unmount()
+    }
+  })
+
+  test('a finished turn sets the task, decisions and last reply from the side pass', async ($, on) => {
+    const reply = JSON.stringify({
+      task: 'Fix websocket reconnect loop',
+      isNewTask: false,
+      decisions: ['Capped backoff at 30s'],
+      attempts: [{ text: 'Patch A with a mutex', isOk: false }],
+      needsYou: ['Approve the PR description?'],
+      note: null,
+    })
+    const { files, clock } = world(on, reply)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+
+    await $.prompt.submit({ text: 'fix the reconnect loop', wait: false, origin: { kind: 'composer' } })
+    await $.turn.complete({ answer: 'Patched the race and added a test.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: 'Fix websocket reconnect loop' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /fix the reconnect loop/ })).toBeDefined()
+    expect(await ui.find({ type: 'Markdown', text: /Patched the race/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /1 dead end/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeDefined()
+
+    const context = [...files.entries()].find(([p]) => p.endsWith('/context.md'))
+    expect(context?.[1]).toContain('# Fix websocket reconnect loop')
+    expect(context?.[1]).toContain('- ✗ Patch A with a mutex')
+    expect(context?.[1]).toContain('- [ ] Approve the PR description?')
+
+    await $.prompt.submit({ text: 'yes, approved', wait: false, origin: { kind: 'composer' } })
+    expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
+  })
+})

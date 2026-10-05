@@ -1,0 +1,46 @@
+{
+  "name": "breadcrumbs",
+  "version": "0.1.0",
+  "description": "An always-on pane with what this session is about: the task, your last prompt, what Claude is doing and last said, and the explanations it wrote, saved as notes you can preview.",
+  "author": {
+    "name": "crockalet"
+  },
+  "repository": "https://github.com/crockalet/breadcrumbs",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "panel": {
+      "type": "string",
+      "title": "Open the pane",
+      "description": "auto opens it when a session starts; command opens it only with /whereami.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "command"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "title": "Side-pass model",
+      "description": "The model that reads each turn to keep the task, decisions, attempts and missed explanations up to date.",
+      "default": "haiku"
+    },
+    "retentionDays": {
+      "type": "number",
+      "title": "Keep sessions (days)",
+      "description": "A session folder untouched this long, or whose worktree is gone, is archived.",
+      "default": 30
+    },
+    "archiveDays": {
+      "type": "number",
+      "title": "Keep archive (days)",
+      "description": "How long an archived session folder stays before it is deleted.",
+      "default": 60
+    },
+    "archive": {
+      "type": "boolean",
+      "title": "Archive before deleting",
+      "description": "Off deletes stale session folders outright instead of archiving them first.",
+      "default": true
+    }
+  }
+}
