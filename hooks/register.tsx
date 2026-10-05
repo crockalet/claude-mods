@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
 import type { Ask, Crumbs, Note, Repo, View, Where } from '../types'
 import { contextMarkdown, repoState } from './markdown'
@@ -235,14 +235,18 @@ const clean = async ($: $) => {
   return { root, now, plan }
 }
 
-type Turn = { answer: string; hasSavedNote: boolean; tools: string[] }
+// `transcript` set means a one-off catch-up over a session that predates the mod.
+type Turn = { answer: string; hasSavedNote: boolean; tools: string[]; transcript?: string }
 
-const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
+const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn) => {
+  const cap = transcript ? 6 : 3
   const state = await readCrumbs($)
   const prompt = state.prompts.at(-1)?.text ?? ''
   const request = [
     'You keep a running log of a coding session for a developer who switches between many sessions.',
-    'Read the latest exchange and answer with one JSON object and nothing else:',
+    transcript
+      ? 'Read this transcript of the session so far and answer with one JSON object and nothing else. It is a catch-up: read "this turn" below as "the session so far", allow up to 6 decisions, attempts and done items, and take needsYou only from the last assistant message.'
+      : 'Read the latest exchange and answer with one JSON object and nothing else:',
     '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "options": string[]}], "done": string[], "note": {"title": string, "markdown": string} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong or too narrow: when the prompts show the current task is one step of a bigger goal, widen it to that goal ("Verify the restart" becomes "Build the breadcrumbs mod").',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
@@ -257,12 +261,9 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
     `Already saved a note this turn: ${hasSavedNote}`,
     `Tools used this turn: ${tools.slice(0, 30).join('; ') || 'none'}`,
     '',
-    '<user_prompt>',
-    clip(prompt, 4000),
-    '</user_prompt>',
-    '<assistant_reply>',
-    answer.slice(0, 12000),
-    '</assistant_reply>',
+    ...(transcript
+      ? ['<transcript>', transcript, '</transcript>']
+      : ['<user_prompt>', clip(prompt, 4000), '</user_prompt>', '<assistant_reply>', answer.slice(0, 12000), '</assistant_reply>']),
   ].join('\n')
 
   const reply = await $.model.complete({ model: cfg.model, prompt: request, maxTokens: 4000, effort: 'low', timeoutMs: 60_000 })
@@ -281,7 +282,7 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
   const attempts = Array.isArray(out.attempts)
     ? out.attempts
         .filter((a): a is { text: string; isOk?: unknown } => typeof a?.text === 'string')
-        .slice(0, 3)
+        .slice(0, cap)
         .map(a => ({ text: clip(a.text, 100), isOk: a.isOk !== false }))
     : []
   await mutate($, c => {
@@ -295,10 +296,10 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
     return {
       ...c,
       tasks,
-      decided: [...c.decided, ...strings(out.decisions, 3, 90)].slice(-20),
+      decided: [...c.decided, ...strings(out.decisions, cap, 90)].slice(-20),
       tried: [...c.tried, ...attempts].slice(-20),
       needsYou: asks(out.needsYou),
-      done: [...c.done, ...strings(out.done, 3, 90).map(text => ({ text, at: now }))].slice(-30),
+      done: [...c.done, ...strings(out.done, cap, 90).map(text => ({ text, at: now }))].slice(-30),
     }
   })
 
@@ -355,6 +356,52 @@ const track = async ($: $, e: Record<string, unknown>) => {
     const dir = cdTarget(e.command, (await $.env.get('HOME')) ?? '')
     if (dir) await mutate($, c => ({ ...c, touched: [...c.touched.filter(d => d !== dir), dir].slice(-20) }))
   }
+}
+
+const isTyped = (m: SessionMessage) =>
+  m.role === 'user' && m.text.trim() !== '' && !m.toolResults?.length && !m.text.trimStart().startsWith('<')
+
+// A session that was running before the mod was installed has history but no breadcrumbs yet.
+const backfill = async ($: $) => {
+  const current = await readCrumbs($)
+  if (current.tasks.length > 0 || current.prompts.length > 0) return
+  let rows: readonly SessionMessage[]
+  try {
+    rows = await $.session.messages()
+  } catch {
+    return
+  }
+  if (!rows.some(isTyped)) return
+
+  const now = await $.clock.now()
+  const home = (await $.env.get('HOME')) ?? ''
+  const edited: string[] = []
+  const touched: string[] = []
+  const lines: string[] = []
+  for (const m of rows) {
+    if (isTyped(m)) lines.push(`User: ${clip(m.text, 1500)}`)
+    if (m.role !== 'assistant') continue
+    if (m.text.trim()) lines.push(`Claude: ${clip(m.text, 2500)}`)
+    for (const use of m.toolUses) {
+      lines.push(`  [${toolLabel(use.tool, use.input)}]`)
+      if (use.isError) continue
+      const file = use.input.file_path ?? use.input.notebook_path
+      if ((use.tool === 'Edit' || use.tool === 'Write' || use.tool === 'NotebookEdit') && typeof file === 'string') edited.push(file)
+      const dir = use.tool === 'Bash' && typeof use.input.command === 'string' ? cdTarget(use.input.command, home) : null
+      if (dir) touched.push(dir)
+    }
+  }
+  const lastSaid = [...rows].reverse().find(m => m.role === 'assistant' && m.text.trim())
+  await mutate($, c => ({
+    ...c,
+    prompts: rows.filter(isTyped).slice(-5).map(m => ({ text: m.text.trim(), at: now })),
+    lastSaid: lastSaid ? { text: head(lastSaid.text.trim(), 600), at: now } : c.lastSaid,
+    edited: [...new Set(edited)].slice(-50),
+    touched: [...new Set(touched)].slice(-20),
+  }))
+  await refreshRepos($)
+  await sidePass($, { answer: '', hasSavedNote: true, tools: [], transcript: lines.join('\n').slice(-30_000) })
+  await save($, 'idle')
 }
 
 const dropAsk = ($: $, question: string) =>
@@ -458,6 +505,7 @@ export const register: Register = (on, options) => {
     if (e.isInteractive && options.panel !== 'command') void $.ui.open({ id: PANE, title: 'breadcrumbs' })
     $.clock.every(30_000, () => $.ui.invalidate('ui.render'))
     $.clock.after(0, () => refreshRepos($))
+    $.clock.after(0, () => backfill($))
     // A hot reload drops the old module's timers, including a pass it just queued; poll so this copy picks it up.
     $.clock.every(15_000, () => runPending($))
 

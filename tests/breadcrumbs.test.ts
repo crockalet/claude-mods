@@ -155,6 +155,33 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: 'Bump the major version?' })).toBeUndefined()
   })
 
+  test('a session with history but no breadcrumbs is backfilled from its transcript', async ($, on) => {
+    const { clock } = world(on, JSON.stringify({ task: 'Add dark mode to settings', done: ['Added a theme toggle to SettingsScreen.tsx'] }))
+    on('session.messages', () => ({
+      value: [
+        { role: 'user', text: '<command-caveat>ignore me</command-caveat>', toolUses: [] },
+        { role: 'user', text: 'add dark mode to the settings screen', toolUses: [] },
+        {
+          role: 'assistant',
+          text: 'Adding a toggle.',
+          toolUses: [{ tool_use_id: 'u1', tool: 'Edit', input: { file_path: '/code/feat-sync/SettingsScreen.tsx' } }],
+        },
+        { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'u1', text: 'ok', isError: false }] },
+        { role: 'assistant', text: 'Dark mode toggle added.', toolUses: [] },
+      ],
+    }))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: 'Add dark mode to settings' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /add dark mode to the settings screen/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /ignore me/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Markdown', text: /Dark mode toggle added/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Added a theme toggle to SettingsScreen.tsx' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /1 file edited/ })).toBeDefined()
+  })
+
   test('state written by an older version still draws', async ($, on) => {
     mock.store(on, { 'dir:abc123def456': '/old' })
     const { files } = world(on, '{}', true)
