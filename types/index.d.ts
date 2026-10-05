@@ -50,6 +50,8 @@ export type View = {
   isShowingPrompts: boolean
   isShowingMore: boolean
   isShowingStatus: boolean
+  picked: Record<string, string>
+  typed: Record<string, string>
 }
 
 declare module 'claude-code' {

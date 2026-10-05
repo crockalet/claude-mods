@@ -128,6 +128,33 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
   })
 
+  test('several questions collect answers and send them together', async ($, on) => {
+    submitted.length = 0
+    const reply = JSON.stringify({
+      task: 'Ship the release',
+      needsYou: [
+        { question: 'Bump the major version?', options: ['Yes', 'No'] },
+        { question: 'Who should review it?', options: [] },
+      ],
+    })
+    const { clock } = world(on, reply)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'ship it', wait: false, origin: { kind: 'composer' } })
+    await $.turn.complete({ answer: 'Ready to ship, two questions.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+    submitted.length = 0
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    await ui.press({ key: 'ask-0-opt-1' })
+    expect(submitted).toEqual([])
+    expect(await ui.find({ key: 'ask-0-opt-1', text: '✓ No' })).toBeDefined()
+    await ui.input({ key: 'ask-1-input', text: 'Sam', kind: 'change' })
+    await ui.press({ key: 'send-answers' })
+
+    expect(submitted).toEqual(['Answers:\n- "Bump the major version?" — No\n- "Who should review it?" — Sam'])
+    expect(await ui.find({ type: 'Text', text: 'Bump the major version?' })).toBeUndefined()
+  })
+
   test('state written by an older version still draws', async ($, on) => {
     mock.store(on, { 'dir:abc123def456': '/old' })
     const { files } = world(on, '{}', true)
@@ -138,6 +165,6 @@ describe('breadcrumbs', () => {
     const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
     expect(await ui.find({ type: 'Text', text: 'Old task' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Delete the dev copy?' })).toBeDefined()
-    expect(await ui.find({ key: 'ask-0-reply' })).toBeDefined()
+    expect(await ui.find({ key: 'ask-0-input' })).toBeDefined()
   })
 })
