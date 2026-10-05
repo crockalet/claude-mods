@@ -105,7 +105,7 @@ describe('breadcrumbs', () => {
     await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
 
     await $.prompt.submit({ text: 'fix the reconnect loop', wait: false, origin: { kind: 'composer' } })
-    await $.turn.complete({ answer: 'Patched the race and added a test.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.turn.complete({ answer: 'Patched the race and added a test. Approve the PR description?', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
     await clock.settle()
 
     const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
@@ -140,7 +140,7 @@ describe('breadcrumbs', () => {
     const { clock } = world(on, reply)
     await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
     await $.prompt.submit({ text: 'ship it', wait: false, origin: { kind: 'composer' } })
-    await $.turn.complete({ answer: 'Ready to ship, two questions.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.turn.complete({ answer: 'Ready to ship. Bump the major version? Who should review it?', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
     await clock.settle()
     submitted.length = 0
 
@@ -174,7 +174,7 @@ describe('breadcrumbs', () => {
     const { clock } = world(on, reply)
     await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
     await $.prompt.submit({ text: 'check payouts', wait: false, origin: { kind: 'composer' } })
-    await $.turn.complete({ answer: 'Two ways to go.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.turn.complete({ answer: 'Two ways to go. Run the megatron query?', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
     await clock.settle()
     submitted.length = 0
 
@@ -190,6 +190,18 @@ describe('breadcrumbs', () => {
     await ui.input({ key: 'ask-0-details', text: 'use the prod replica', kind: 'change' })
     await ui.press({ key: 'send-answers' })
     expect(submitted).toEqual([`Re: "Run the megatron query to check payout_amount?" — Yes, I'll run it (details: use the prod replica)`])
+  })
+
+  test('a reply that asks nothing leaves nothing under needs you', async ($, on) => {
+    const { clock } = world(on, JSON.stringify({ task: 'Ship it', needsYou: [{ question: 'Add a submit button?', options: ['Yes', 'No'] }] }))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'add a submit button', wait: false, origin: { kind: 'composer' } })
+    await $.turn.complete({ answer: 'Added the submit button and pushed it.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: 'Ship it' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Needs you' })).toBeUndefined()
   })
 
   test('a session with history but no breadcrumbs is backfilled from its transcript', async ($, on) => {

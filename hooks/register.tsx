@@ -300,7 +300,8 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
       tasks,
       decided: [...c.decided, ...strings(out.decisions, cap, 90)].slice(-20),
       tried: [...c.tried, ...attempts].slice(-20),
-      needsYou: asks(out.needsYou),
+      // Haiku sometimes turns the user's own requests into questions; a reply that asks nothing has none.
+      needsYou: answer.includes('?') ? asks(out.needsYou) : [],
       done: [...c.done, ...strings(out.done, cap, 90).map(text => ({ text, at: now }))].slice(-30),
     }
   })
@@ -402,7 +403,7 @@ const backfill = async ($: $) => {
     touched: [...new Set(touched)].slice(-20),
   }))
   await refreshRepos($)
-  await sidePass($, { answer: '', hasSavedNote: true, tools: [], transcript: lines.join('\n').slice(-30_000) })
+  await sidePass($, { answer: lastSaid?.text ?? '', hasSavedNote: true, tools: [], transcript: lines.join('\n').slice(-30_000) })
   await save($, 'idle')
 }
 
