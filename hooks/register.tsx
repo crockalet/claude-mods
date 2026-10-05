@@ -853,14 +853,15 @@ export const register: Register = (on, options) => {
             ))}
             {c.repos.map(r => {
               const state = repoState(r)
+              const name = basename(r.root)
+              // Clip the branch, not the row, so a long one never wraps or hides the push state.
+              const room = Math.max(8, width - name.length - state.length - 8)
               return (
-                <Box>
+                <Text wrap="truncate-end">
                   <Text dimColor>{'⎇ '}</Text>
-                  <Text wrap="truncate-end">
-                    {basename(r.root)} · {r.branch} ·{' '}
-                  </Text>
+                  {name} · {clip(r.branch, room)} ·{' '}
                   <Text color={state === '✓ pushed' ? 'success' : 'warning'}>{state}</Text>
-                </Box>
+                </Text>
               )
             })}
             {c.edited.length > 0 && (
