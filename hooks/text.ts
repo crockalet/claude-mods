@@ -73,7 +73,7 @@ export const asks = (value: unknown): { question: string; options: string[] }[] 
         .map(v => (typeof v === 'string' ? { question: v, options: [] } : v))
         .filter((v): v is { question: string; options?: unknown } => typeof v?.question === 'string' && v.question.trim() !== '')
         .slice(0, 4)
-        .map(v => ({ question: clip(v.question, 80), options: strings(v.options, 4, 24) }))
+        .map(v => ({ question: clip(v.question, 80), options: strings(v.options, 4, 80) }))
     : []
 
 export const parseStatus = (out: string) => {

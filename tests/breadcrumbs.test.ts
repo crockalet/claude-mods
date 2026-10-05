@@ -97,7 +97,7 @@ describe('breadcrumbs', () => {
       isNewTask: false,
       decisions: ['Capped backoff at 30s'],
       attempts: [{ text: 'Patch A with a mutex', isOk: false }],
-      needsYou: [{ question: 'Approve the PR description?', options: ['Yes', 'No'] }],
+      needsYou: [{ question: 'Approve the PR description?', options: ['Yes, approve it as written', 'No'] }],
       done: ['Pushed main to crockalet/breadcrumbs'],
       note: null,
     })
@@ -124,7 +124,7 @@ describe('breadcrumbs', () => {
     expect(context?.[1]).toContain('- [ ] Approve the PR description?')
 
     await ui.press({ key: 'ask-0-opt-0' })
-    expect(submitted.at(-1)).toBe('Re: "Approve the PR description?" — Yes')
+    expect(submitted.at(-1)).toBe('Re: "Approve the PR description?" — Yes, approve it as written')
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
   })
 

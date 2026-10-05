@@ -597,7 +597,7 @@ export const register: Register = (on, options) => {
                 </Box>
                 <Box marginLeft={2} columnGap={1} flexWrap="wrap">
                   {ask.options.map((option, j) => (
-                    <Button key={`ask-${i}-opt-${j}`} label={option} onPress={() => answerAsk($, ask, option)} />
+                    <Button key={`ask-${i}-opt-${j}`} label={clip(option, 24)} onPress={() => answerAsk($, ask, option)} />
                   ))}
                   <Button key={`ask-${i}-reply`} plain dimColor label="reply…" onPress={() => draftAsk($, ask)} />
                   <Button key={`ask-${i}-dismiss`} plain dimColor label="dismiss" onPress={() => dropAsk($, ask.question)} />
