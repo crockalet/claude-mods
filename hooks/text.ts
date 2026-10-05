@@ -76,6 +76,31 @@ export const asks = (value: unknown): { question: string; options: string[] }[] 
         .map(v => ({ question: clip(v.question, 80), options: strings(v.options, 4, 24) }))
     : []
 
+export const parseStatus = (out: string) => {
+  const [first = '', ...rest] = out.split('\n')
+  const header = first.replace(/^## /, '')
+  const [branchPart = '', trackPart = ''] = header.split('...')
+  const branch = branchPart.replace(/^No commits yet on /, '').replace(/ \[.*$/, '')
+
+  return {
+    branch: branch === 'HEAD (no branch)' ? 'detached' : branch,
+    hasUpstream: trackPart !== '',
+    ahead: Number(/ahead (\d+)/.exec(header)?.[1] ?? 0),
+    behind: Number(/behind (\d+)/.exec(header)?.[1] ?? 0),
+    changed: rest.filter(line => line.trim() !== '').length,
+  }
+}
+
+// `cd <dir> && …` is how most commands reach another repo, so it marks that repo as touched.
+export const cdTarget = (command: string, home: string): string | null => {
+  const match = /^\s*cd\s+("([^"]+)"|'([^']+)'|(\S+))/.exec(command)
+  const raw = match?.[2] ?? match?.[3] ?? match?.[4]
+  if (!raw) return null
+  const dir = raw.replace(/^~(?=\/|$)/, home).replace(/\/+$/, '')
+
+  return dir.startsWith('/') ? dir : null
+}
+
 export const toolLabel = (tool: string, input: Record<string, unknown>): string => {
   const file = str(input.file_path) || str(input.notebook_path)
   switch (tool) {

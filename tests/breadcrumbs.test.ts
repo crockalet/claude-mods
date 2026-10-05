@@ -31,7 +31,13 @@ const world = (on: On, reply = '{}') => {
   on('session.cwd', () => ({ value: '/code/feat-sync' }))
   on('session.repo', () => ({ value: { root: '/code/acme-app', remote: null, internal: false, name: null } }))
   on('process.run', ($, e) => {
-    const out = e.argv.includes('--show-toplevel') ? '/code/feat-sync\n' : e.argv.includes('--show-current') ? 'feat/sync\n' : ''
+    const out = e.argv.includes('--show-toplevel')
+      ? '/code/feat-sync\n'
+      : e.argv.includes('--show-current')
+        ? 'feat/sync\n'
+        : e.argv.includes('status')
+          ? '## feat/sync...origin/feat/sync [ahead 1]\n M hooks/a.ts\n'
+          : ''
     return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('fs.write', ($, e) => {
@@ -92,6 +98,7 @@ describe('breadcrumbs', () => {
       decisions: ['Capped backoff at 30s'],
       attempts: [{ text: 'Patch A with a mutex', isOk: false }],
       needsYou: [{ question: 'Approve the PR description?', options: ['Yes', 'No'] }],
+      done: ['Pushed main to crockalet/breadcrumbs'],
       note: null,
     })
     const { files, clock } = world(on, reply)
@@ -107,6 +114,9 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Markdown', text: /Patched the race/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 dead end/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Pushed main to crockalet/breadcrumbs' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '1 uncommitted · ↑1 unpushed' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /❯/ })).toBeUndefined()
 
     const context = [...files.entries()].find(([p]) => p.endsWith('/context.md'))
     expect(context?.[1]).toContain('# Fix websocket reconnect loop')

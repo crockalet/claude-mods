@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Ask, Crumbs, Note, View, Where } from '../types'
-import { contextMarkdown } from './markdown'
+import type { Ask, Crumbs, Note, Repo, View, Where } from '../types'
+import { contextMarkdown, repoState } from './markdown'
 import type { Saved } from './markdown'
-import { ago, asks, basename, clip, day, head, parseObject, slug, stamp, strings, toolLabel } from './text'
+import { ago, asks, basename, cdTarget, clip, day, head, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
 const SAVE_NOTE = 'mcp__breadcrumbs__save_note'
@@ -17,6 +17,10 @@ const EMPTY: Crumbs = {
   decided: [],
   tried: [],
   needsYou: [],
+  done: [],
+  edited: [],
+  touched: [],
+  repos: [],
   asking: null,
 }
 
@@ -26,6 +30,7 @@ const view = atom({ plugin: 'breadcrumbs', key: 'view' } as const, {
   openNote: null,
   isShowingPrompts: false,
   isShowingMore: false,
+  isShowingStatus: false,
 } satisfies View)
 const pending = atom({ plugin: 'breadcrumbs', key: 'pending' } as const, null)
 
@@ -41,25 +46,44 @@ type $ = EngineInterface
 const notesRoot = async ($: $): Promise<string> =>
   `${(await $.env.get('HOME')) ?? '~'}/.agents/notes`
 
+const git = async ($: $, cwd: string, ...args: string[]): Promise<string | null> => {
+  try {
+    const run = await $.process.run(['git', ...args], { cwd, timeoutMs: 3000 })
+
+    return run.exitCode === 0 ? run.stdout : null
+  } catch {
+    return null
+  }
+}
+
 const locate = async ($: $): Promise<Where> => {
   const cwd = await $.session.cwd()
-  const git = async (...args: string[]) => {
-    try {
-      const run = await $.process.run(['git', ...args], { cwd, timeoutMs: 3000 })
-
-      return run.exitCode === 0 ? run.stdout.trim() : ''
-    } catch {
-      return ''
-    }
-  }
   const repo = await $.session.repo()
-  const worktree = (await git('rev-parse', '--show-toplevel')) || cwd
+  const worktree = (await git($, cwd, 'rev-parse', '--show-toplevel'))?.trim() || cwd
 
   return {
     repo: repo ? basename(repo.root) : basename(worktree),
-    branch: await git('branch', '--show-current'),
+    branch: (await git($, cwd, 'branch', '--show-current'))?.trim() ?? '',
     worktree,
   }
+}
+
+const refreshRepos = async ($: $) => {
+  const c = await read($, crumbs)
+  const place = await read($, where)
+  const places = new Set([...c.touched, ...c.edited.map(f => f.slice(0, f.lastIndexOf('/')))])
+  if (place) places.add(place.worktree)
+  const roots = new Set<string>()
+  for (const dir of places) {
+    const root = (await git($, dir, 'rev-parse', '--show-toplevel'))?.trim()
+    if (root) roots.add(root)
+  }
+  const repos: Repo[] = []
+  for (const root of roots) {
+    const status = await git($, root, 'status', '--porcelain=v1', '-b')
+    if (status !== null) repos.push({ root, ...parseStatus(status) })
+  }
+  await update($, crumbs, old => ({ ...old, repos }))
 }
 
 const worktreeDir = (root: string, where: Where) =>
@@ -225,10 +249,11 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
   const request = [
     'You keep a running log of a coding session for a developer who switches between many sessions.',
     'Read the latest exchange and answer with one JSON object and nothing else:',
-    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "options": string[]}], "note": {"title": string, "markdown": string} | null}',
+    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "options": string[]}], "done": string[], "note": {"title": string, "markdown": string} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong.',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
     '- decisions: design or approach choices the assistant made on its own this turn where another option was reasonable and the user did not specify it ("Capped backoff at 30s instead of 60s"). Not actions taken, checks run or instructions given to the user. At most 3, under 90 characters each. Usually empty.',
+    '- done: concrete results this turn that changed something outside the conversation, past tense, naming what changed ("Pushed main to crockalet/breadcrumbs", "Installed breadcrumbs plugin (user scope)", "Fixed reconnect race in socket.ts"). Not reads, checks, explanations or plans. At most 3, under 90 characters each. Usually empty.',
     '- needsYou: what the reply leaves for the user to answer or decide: explicit questions, approvals, choices between options. Each question is short, under 80 characters ("Approve the PR description?"). options: 2 to 4 short answer labels when the question has discrete choices ("Yes", "No", or the named options), else []. Empty list when the reply asks nothing.',
     '- attempts: approaches tried this turn, isOk false when one failed or was abandoned (at most 3). Empty when none.',
     '- note: only when the user asked for an explanation or summary, the reply contains it at a paragraph or more (not a one-line answer), and it was not saved already. markdown is that explanation, kept close to the reply\'s own words. Otherwise null.',
@@ -279,6 +304,7 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
       decided: [...c.decided, ...strings(out.decisions, 3, 90)].slice(-20),
       tried: [...c.tried, ...attempts].slice(-20),
       needsYou: asks(out.needsYou),
+      done: [...c.done, ...strings(out.done, 3, 90).map(text => ({ text, at: now }))].slice(-30),
     }
   })
 
@@ -326,6 +352,17 @@ const pin = async ($: $, note: Note) => {
   $.ui.toast(`Pinned "${note.title}"`)
 }
 
+const track = async ($: $, e: Record<string, unknown>) => {
+  const file = typeof e.file_path === 'string' ? e.file_path : typeof e.notebook_path === 'string' ? e.notebook_path : ''
+  if ((e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit') && file) {
+    await update($, crumbs, c => ({ ...c, edited: [...c.edited.filter(f => f !== file), file].slice(-50) }))
+  }
+  if (e.tool === 'Bash' && typeof e.command === 'string') {
+    const dir = cdTarget(e.command, (await $.env.get('HOME')) ?? '')
+    if (dir) await update($, crumbs, c => ({ ...c, touched: [...c.touched.filter(d => d !== dir), dir].slice(-20) }))
+  }
+}
+
 const dropAsk = ($: $, question: string) =>
   update($, crumbs, c => ({ ...c, needsYou: c.needsYou.filter(a => a.question !== question) }))
 
@@ -354,6 +391,8 @@ export const register: Register = (on, options) => {
 
     const known = await $.store.get(`dir:${sessionId}`)
     dir = typeof known === 'string' ? known : null
+    // Session state outlives reloads, so state written by an older version lacks newer fields.
+    await update($, crumbs, old => ({ ...EMPTY, ...old, needsYou: asks(old.needsYou) }))
     const current = await read($, crumbs)
     if (dir && current.tasks.length === 0 && current.notes.length === 0) {
       const saved = await readSaved($, dir)
@@ -438,7 +477,9 @@ export const register: Register = (on, options) => {
     turnTools.push(label)
     if (e.tool !== 'AskUserQuestion') {
       await update($, crumbs, c => ({ ...c, activity: label }))
-      return next(e)
+      const ran = await next(e)
+      if (ran.deny === undefined && ran.isError !== true) await track($, e as Record<string, unknown>)
+      return ran
     }
     const question = e.questions[0]?.question ?? 'A question for you'
     await update($, crumbs, c => ({ ...c, activity: 'Waiting on you', asking: clip(question, 120) }))
@@ -453,6 +494,7 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
 
+    await refreshRepos($)
     const now = await $.clock.now()
     const answer = e.answer.trim()
     await update($, crumbs, c => ({
@@ -583,10 +625,7 @@ export const register: Register = (on, options) => {
                 <Button key="prompts" plain dimColor label={v.isShowingPrompts ? 'less' : 'earlier'} onPress={set({ isShowingPrompts: !v.isShowingPrompts })} />
               )}
             </Box>
-            <Box>
-              <Text dimColor>{'❯ '}</Text>
-              <Text>{clip(prompt.text, width * 4)}</Text>
-            </Box>
+            <Text>{clip(prompt.text, width * 4)}</Text>
             {v.isShowingPrompts &&
               earlier.map(p => (
                 <Text dimColor wrap="truncate-end">
@@ -614,6 +653,50 @@ export const register: Register = (on, options) => {
                 </Box>
               </Box>
             )}
+          </Box>
+        )}
+
+        {(c.done.length > 0 || c.repos.length > 0 || c.edited.length > 0) && (
+          <Box flexDirection="column">
+            <Box justifyContent="space-between">
+              <Text dimColor>Done{c.done.length > 0 ? ` · ${c.done.length}` : ''}</Text>
+              {(c.done.length > 3 || c.edited.length > 0) && (
+                <Button key="status" plain dimColor label={v.isShowingStatus ? 'less' : 'more'} onPress={set({ isShowingStatus: !v.isShowingStatus })} />
+              )}
+            </Box>
+            {c.done.slice(v.isShowingStatus ? -12 : -3).map(d => (
+              <Box>
+                <Text color="success">{'✓ '}</Text>
+                <Text>{d.text}</Text>
+              </Box>
+            ))}
+            {c.repos.map(r => {
+              const state = repoState(r)
+              return (
+                <Box>
+                  <Text dimColor>{'⎇ '}</Text>
+                  <Text wrap="truncate-end">
+                    {basename(r.root)} · {r.branch} ·{' '}
+                  </Text>
+                  <Text color={state === '✓ pushed' ? 'success' : 'warning'}>{state}</Text>
+                </Box>
+              )
+            })}
+            {c.edited.length > 0 && (
+              <Text dimColor>
+                {c.edited.length} file{c.edited.length > 1 ? 's' : ''} edited
+              </Text>
+            )}
+            {v.isShowingStatus &&
+              c.edited
+                .slice(-12)
+                .reverse()
+                .map(f => (
+                  <Text dimColor wrap="truncate-start">
+                    {'  '}
+                    {f.replace(/^\/Users\/[^/]+/, '~')}
+                  </Text>
+                ))}
           </Box>
         )}
 

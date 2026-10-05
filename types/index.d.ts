@@ -12,6 +12,15 @@ export type Attempt = { text: string; isOk: boolean }
 
 export type Ask = { question: string; options: string[] }
 
+export type Repo = {
+  root: string
+  branch: string
+  changed: number
+  ahead: number
+  behind: number
+  hasUpstream: boolean
+}
+
 export type Stamped = { text: string; at: number }
 
 export type Crumbs = {
@@ -23,6 +32,10 @@ export type Crumbs = {
   decided: string[]
   tried: Attempt[]
   needsYou: Ask[]
+  done: Stamped[]
+  edited: string[]
+  touched: string[]
+  repos: Repo[]
   asking: string | null
 }
 
@@ -36,6 +49,7 @@ export type View = {
   openNote: string | null
   isShowingPrompts: boolean
   isShowingMore: boolean
+  isShowingStatus: boolean
 }
 
 declare module 'claude-code' {
