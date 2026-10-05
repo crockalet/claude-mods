@@ -66,6 +66,16 @@ export const strings = (value: unknown, max: number, each = 100): string[] =>
 
 const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 
+// Older state.json files stored needs-you items as bare strings.
+export const asks = (value: unknown): { question: string; options: string[] }[] =>
+  Array.isArray(value)
+    ? value
+        .map(v => (typeof v === 'string' ? { question: v, options: [] } : v))
+        .filter((v): v is { question: string; options?: unknown } => typeof v?.question === 'string' && v.question.trim() !== '')
+        .slice(0, 4)
+        .map(v => ({ question: clip(v.question, 80), options: strings(v.options, 4, 24) }))
+    : []
+
 export const toolLabel = (tool: string, input: Record<string, unknown>): string => {
   const file = str(input.file_path) || str(input.notebook_path)
   switch (tool) {

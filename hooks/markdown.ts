@@ -1,5 +1,5 @@
 import type { Crumbs, Where } from '../types'
-import { basename, stamp } from './text'
+import { asks, basename, stamp } from './text'
 
 export type Saved = Crumbs & { session: string; worktree: string; updatedAt: number }
 
@@ -21,8 +21,8 @@ export const contextMarkdown = (saved: Saved, where: Where, status: string): str
   if (saved.tasks.length > 1) {
     lines.push('Earlier in this session:', ...saved.tasks.slice(1).map(t => `- ${t.title}`), '')
   }
-  const waiting = saved.needsYou ?? []
-  if (waiting.length > 0) lines.push('## Needs you', '', ...waiting.map(q => `- [ ] ${q}`), '')
+  const waiting = asks(saved.needsYou)
+  if (waiting.length > 0) lines.push('## Needs you', '', ...waiting.map(a => `- [ ] ${a.question}`), '')
   const prompt = saved.prompts.at(-1)
   if (prompt) lines.push('## You asked', '', ...prompt.text.split('\n').map(l => `> ${l}`), '')
   if (saved.lastSaid) lines.push('## Claude last said', '', saved.lastSaid.text, '')

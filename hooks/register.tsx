@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Crumbs, Note, View, Where } from '../types'
+import type { Ask, Crumbs, Note, View, Where } from '../types'
 import { contextMarkdown } from './markdown'
 import type { Saved } from './markdown'
-import { ago, basename, clip, day, head, parseObject, slug, stamp, strings, toolLabel } from './text'
+import { ago, asks, basename, clip, day, head, parseObject, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
 const SAVE_NOTE = 'mcp__breadcrumbs__save_note'
@@ -87,7 +87,7 @@ const writeIndex = async ($: $, wtDir: string) => {
     if (!saved) continue
     const task = clip(saved.tasks[0]?.title ?? 'No task yet', 70)
     const notes = saved.notes.length === 1 ? '1 note' : `${saved.notes.length} notes`
-    const waiting = (saved.needsYou ?? []).length > 0 ? ' · needs you' : ''
+    const waiting = asks(saved.needsYou).length > 0 ? ' · needs you' : ''
     rows.push({
       at: saved.updatedAt,
       line: `- ${task}${waiting} · ${notes} · ${stamp(saved.updatedAt)} → [${entry.name}/](${entry.name}/context.md)`,
@@ -225,11 +225,11 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
   const request = [
     'You keep a running log of a coding session for a developer who switches between many sessions.',
     'Read the latest exchange and answer with one JSON object and nothing else:',
-    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": string[], "note": {"title": string, "markdown": string} | null}',
+    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "options": string[]}], "note": {"title": string, "markdown": string} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong.',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
     '- decisions: design or approach choices the assistant made on its own this turn where another option was reasonable and the user did not specify it ("Capped backoff at 30s instead of 60s"). Not actions taken, checks run or instructions given to the user. At most 3, under 90 characters each. Usually empty.',
-    '- needsYou: what the reply leaves for the user to answer or decide: explicit questions, approvals, choices between options. Each a short question under 80 characters ("Approve the PR description?"). Empty when the reply asks nothing.',
+    '- needsYou: what the reply leaves for the user to answer or decide: explicit questions, approvals, choices between options. Each question is short, under 80 characters ("Approve the PR description?"). options: 2 to 4 short answer labels when the question has discrete choices ("Yes", "No", or the named options), else []. Empty list when the reply asks nothing.',
     '- attempts: approaches tried this turn, isOk false when one failed or was abandoned (at most 3). Empty when none.',
     '- note: only when the user asked for an explanation or summary, the reply contains it at a paragraph or more (not a one-line answer), and it was not saved already. markdown is that explanation, kept close to the reply\'s own words. Otherwise null.',
     '',
@@ -278,7 +278,7 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
       tasks,
       decided: [...c.decided, ...strings(out.decisions, 3, 90)].slice(-20),
       tried: [...c.tried, ...attempts].slice(-20),
-      needsYou: strings(out.needsYou, 4, 80),
+      needsYou: asks(out.needsYou),
     }
   })
 
@@ -326,6 +326,20 @@ const pin = async ($: $, note: Note) => {
   $.ui.toast(`Pinned "${note.title}"`)
 }
 
+const dropAsk = ($: $, question: string) =>
+  update($, crumbs, c => ({ ...c, needsYou: c.needsYou.filter(a => a.question !== question) }))
+
+const answerAsk = async ($: $, ask: Ask, option: string) => {
+  await dropAsk($, ask.question)
+  // Queued by the engine until the session is idle, so pressing mid-turn is safe.
+  await $.prompt.submit({ text: `Re: "${ask.question}" — ${option}`, asUser: true })
+}
+
+const draftAsk = async ($: $, ask: Ask) => {
+  await $.prompt.fill({ text: `Re: "${ask.question}" — `, mode: 'insert' })
+  $.ui.toast('Finish your answer in the prompt box')
+}
+
 export const register: Register = (on, options) => {
   cfg.model = String(options.model ?? 'haiku')
   cfg.retentionDays = Number(options.retentionDays ?? 30)
@@ -345,7 +359,7 @@ export const register: Register = (on, options) => {
       const saved = await readSaved($, dir)
       if (saved) {
         const { session: _s, worktree: _w, updatedAt: _u, ...restored } = saved
-        await update($, crumbs, () => ({ ...EMPTY, ...restored, activity: null, asking: null }))
+        await update($, crumbs, () => ({ ...EMPTY, ...restored, needsYou: asks(restored.needsYou), activity: null, asking: null }))
       }
     }
 
@@ -394,7 +408,8 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'composer' && e.text.trim() && !e.text.trimStart().startsWith('/')) {
+    const isPerson = e.origin.kind === 'composer' || (e.origin.kind === 'plugin' && e.origin.name === 'breadcrumbs')
+    if (isPerson && e.text.trim() && !e.text.trimStart().startsWith('/')) {
       const now = await $.clock.now()
       // A new prompt usually answers what was pending; the next side pass re-asks anything still open.
       await update($, crumbs, c => ({ ...c, needsYou: [], prompts: [...c.prompts, { text: e.text.trim(), at: now }].slice(-5) }))
@@ -534,15 +549,27 @@ export const register: Register = (on, options) => {
           <Box flexDirection="column">
             <Text color="warning">Needs you</Text>
             {c.asking && (
-              <Box>
-                <Text color="warning">{'● '}</Text>
-                <Text bold>{c.asking}</Text>
+              <Box flexDirection="column">
+                <Box>
+                  <Text color="warning">{'● '}</Text>
+                  <Text bold>{c.asking}</Text>
+                </Box>
+                <Text dimColor>{'  answer in the dialog below'}</Text>
               </Box>
             )}
-            {c.needsYou.map(q => (
-              <Box>
-                <Text color="warning">{'◆ '}</Text>
-                <Text>{q}</Text>
+            {c.needsYou.map((ask, i) => (
+              <Box key={`ask-${i}`} flexDirection="column">
+                <Box>
+                  <Text color="warning">{'◆ '}</Text>
+                  <Text>{ask.question}</Text>
+                </Box>
+                <Box marginLeft={2} columnGap={1} flexWrap="wrap">
+                  {ask.options.map((option, j) => (
+                    <Button key={`ask-${i}-opt-${j}`} label={option} onPress={() => answerAsk($, ask, option)} />
+                  ))}
+                  <Button key={`ask-${i}-reply`} plain dimColor label="reply…" onPress={() => draftAsk($, ask)} />
+                  <Button key={`ask-${i}-dismiss`} plain dimColor label="dismiss" onPress={() => dropAsk($, ask.question)} />
+                </Box>
               </Box>
             ))}
           </Box>

@@ -10,6 +10,8 @@ export type Task = { title: string; at: number }
 
 export type Attempt = { text: string; isOk: boolean }
 
+export type Ask = { question: string; options: string[] }
+
 export type Stamped = { text: string; at: number }
 
 export type Crumbs = {
@@ -20,7 +22,7 @@ export type Crumbs = {
   notes: Note[]
   decided: string[]
   tried: Attempt[]
-  needsYou: string[]
+  needsYou: Ask[]
   asking: string | null
 }
 

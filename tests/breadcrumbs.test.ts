@@ -17,6 +17,8 @@ const PANE = {
   },
 } as const
 
+const submitted: string[] = []
+
 const world = (on: On, reply = '{}') => {
   const files = new Map<string, string>()
   const clock = mock.clock(on, { now: NOW })
@@ -47,7 +49,10 @@ const world = (on: On, reply = '{}') => {
     value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
   }))
   on('turn.complete', () => ({ text: '' }))
-  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('prompt.submit', ($, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
 
   return { files, clock }
 }
@@ -86,7 +91,7 @@ describe('breadcrumbs', () => {
       isNewTask: false,
       decisions: ['Capped backoff at 30s'],
       attempts: [{ text: 'Patch A with a mutex', isOk: false }],
-      needsYou: ['Approve the PR description?'],
+      needsYou: [{ question: 'Approve the PR description?', options: ['Yes', 'No'] }],
       note: null,
     })
     const { files, clock } = world(on, reply)
@@ -108,7 +113,8 @@ describe('breadcrumbs', () => {
     expect(context?.[1]).toContain('- ✗ Patch A with a mutex')
     expect(context?.[1]).toContain('- [ ] Approve the PR description?')
 
-    await $.prompt.submit({ text: 'yes, approved', wait: false, origin: { kind: 'composer' } })
+    await ui.press({ key: 'ask-0-opt-0' })
+    expect(submitted.at(-1)).toBe('Re: "Approve the PR description?" — Yes')
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
   })
 })
