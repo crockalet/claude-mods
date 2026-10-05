@@ -10,7 +10,7 @@ export type Task = { title: string; at: number }
 
 export type Attempt = { text: string; isOk: boolean }
 
-export type Ask = { question: string; options: string[] }
+export type Ask = { question: string; context: string; options: string[]; optionNotes: string[] }
 
 export type Repo = {
   root: string
@@ -52,6 +52,8 @@ export type View = {
   isShowingStatus: boolean
   picked: Record<string, string>
   typed: Record<string, string>
+  details: Record<string, string>
+  expanded: string | null
 }
 
 declare module 'claude-code' {

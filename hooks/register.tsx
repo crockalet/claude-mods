@@ -19,6 +19,8 @@ const VIEW: View = {
   isShowingStatus: false,
   picked: {},
   typed: {},
+  details: {},
+  expanded: null,
 }
 const view = atom({ plugin: 'breadcrumbs', key: 'view' } as const, VIEW)
 const pending = atom({ plugin: 'breadcrumbs', key: 'pending' } as const, null)
@@ -247,12 +249,12 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
     transcript
       ? 'Read this transcript of the session so far and answer with one JSON object and nothing else. It is a catch-up: read "this turn" below as "the session so far", allow up to 6 decisions, attempts and done items, and take needsYou only from the last assistant message.'
       : 'Read the latest exchange and answer with one JSON object and nothing else:',
-    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "options": string[]}], "done": string[], "note": {"title": string, "markdown": string} | null}',
+    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "context": string, "options": [{"label": string, "description": string}]}], "done": string[], "note": {"title": string, "markdown": string} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong or too narrow: when the prompts show the current task is one step of a bigger goal, widen it to that goal ("Verify the restart" becomes "Build the breadcrumbs mod").',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
     '- decisions: design or approach choices the assistant made on its own this turn where another option was reasonable and the user did not specify it ("Capped backoff at 30s instead of 60s"). Not actions taken, checks run or instructions given to the user. At most 3, under 90 characters each. Usually empty.',
     '- done: concrete results of this turn, from the assistant reply and tools used, that changed something outside the conversation, past tense, naming what changed ("Pushed main to crockalet/breadcrumbs", "Installed breadcrumbs plugin (user scope)", "Fixed reconnect race in socket.ts"). Not reads, checks, explanations or plans. At most 3, under 90 characters each. Usually empty.',
-    '- needsYou: what the assistant reply itself asks the user to answer or decide (never questions inferred from the earlier prompts or the task): explicit questions, approvals, choices between options. Each question is short, under 80 characters ("Approve the PR description?"). options: 2 to 4 short answer labels when the question has discrete choices ("Yes", "No", or the named options), else []. Empty list when the reply asks nothing.',
+    '- needsYou: what the assistant reply itself asks the user to answer or decide (never questions inferred from the earlier prompts or the task): explicit questions, approvals, choices between options. Each question is short, under 80 characters ("Approve the PR description?"). context: one or two sentences from the reply that someone needs to answer well (what is at stake, what each choice leads to). options: 2 to 4 when the question has discrete choices, each a short label ("Yes, I\'ll run it") and a one-line description of what that choice means, else []. Empty list when the reply asks nothing.',
     '- attempts: approaches tried this turn, isOk false when one failed or was abandoned (at most 3). Empty when none.',
     '- note: only when the user asked for an explanation or summary, the reply contains it at a paragraph or more (not a one-line answer), and it was not saved already. markdown is that explanation, kept close to the reply\'s own words. Otherwise null.',
     '',
@@ -417,10 +419,18 @@ const setView = ($: $, fn: (v: View) => View) => update($, view, old => fn({ ...
 
 const answerOf = (v: View, question: string) => v.typed[question]?.trim() || v.picked[question] || ''
 
+const withDetails = (v: View, question: string, answer: string) => {
+  const details = v.details[question]?.trim()
+  if (!details) return answer
+  return answer ? `${answer} (details: ${details})` : details
+}
+
 // With one question a choice is the whole answer; with several, choices collect until Send.
 const pickAsk = async ($: $, ask: Ask, option: string) => {
   const { needsYou } = await readCrumbs($)
-  if (needsYou.length <= 1) return answerAsk($, ask, option)
+  const v = { ...VIEW, ...(await read($, view)) }
+  // An open question is where details get added, so a choice there waits for Send.
+  if (needsYou.length <= 1 && v.expanded !== ask.question) return answerAsk($, ask, withDetails(v, ask.question, option))
   await setView($, v => {
     const picked = { ...v.picked }
     if (picked[ask.question] === option) delete picked[ask.question]
@@ -434,14 +444,17 @@ const typeAsk = ($: $, ask: Ask, text: string) =>
 
 const submitTyped = async ($: $, ask: Ask, text: string) => {
   const { needsYou } = await readCrumbs($)
-  if (needsYou.length <= 1 && text.trim()) return answerAsk($, ask, text.trim())
+  const v = { ...VIEW, ...(await read($, view)) }
+  if (needsYou.length <= 1 && v.expanded !== ask.question && text.trim()) return answerAsk($, ask, withDetails(v, ask.question, text.trim()))
   await typeAsk($, ask, text)
 }
 
 const sendAnswers = async ($: $) => {
   const { needsYou } = await readCrumbs($)
   const v = { ...VIEW, ...(await read($, view)) }
-  const answered = needsYou.map(a => ({ ask: a, answer: answerOf(v, a.question) })).filter(a => a.answer)
+  const answered = needsYou
+    .map(a => ({ ask: a, answer: withDetails(v, a.question, answerOf(v, a.question)) }))
+    .filter(a => a.answer)
   if (answered.length === 0) {
     $.ui.toast('Pick or type an answer first')
     return
@@ -452,9 +465,15 @@ const sendAnswers = async ($: $) => {
       : ['Answers:', ...answered.map(a => `- "${a.ask.question}" — ${a.answer}`)].join('\n')
   const done = new Set(answered.map(a => a.ask.question))
   await mutate($, c => ({ ...c, needsYou: c.needsYou.filter(a => !done.has(a.question)) }))
-  await setView($, old => ({ ...old, picked: {}, typed: {} }))
+  await setView($, old => ({ ...old, picked: {}, typed: {}, details: {}, expanded: null }))
   await $.prompt.submit({ text, asUser: true })
 }
+
+const detailAsk = ($: $, ask: Ask, text: string) =>
+  setView($, v => ({ ...v, details: { ...v.details, [ask.question]: text } }))
+
+const toggleAsk = ($: $, ask: Ask) =>
+  setView($, v => ({ ...v, expanded: v.expanded === ask.question ? null : ask.question }))
 
 const draftAsk = async ($: $, ask: Ask) => {
   await $.prompt.fill({ text: `Re: "${ask.question}" — `, mode: 'insert' })
@@ -536,7 +555,7 @@ export const register: Register = (on, options) => {
       const now = await $.clock.now()
       // A new prompt usually answers what was pending; the next side pass re-asks anything still open.
       await mutate($, c => ({ ...c, needsYou: [], prompts: [...c.prompts, { text: e.text.trim(), at: now }].slice(-5) }))
-      await setView($, v => ({ ...v, picked: {}, typed: {} }))
+      await setView($, v => ({ ...v, picked: {}, typed: {}, details: {}, expanded: null }))
       if (e.turnId === undefined) {
         turnTools = []
         hasSavedNote = false
@@ -636,7 +655,8 @@ export const register: Register = (on, options) => {
     const elements = $.ui.resolve(e)
     const Input = 'Input' in elements ? elements.Input : undefined
     const isMany = c.needsYou.length > 1
-    const answeredCount = c.needsYou.filter(a => answerOf(v, a.question)).length
+    const answeredCount = c.needsYou.filter(a => withDetails(v, a.question, answerOf(v, a.question))).length
+    const hasSend = isMany || c.needsYou.some(a => a.question === v.expanded)
 
     const task = c.tasks[0]
     const prompt = c.prompts.at(-1)
@@ -688,42 +708,82 @@ export const register: Register = (on, options) => {
                 <Text dimColor>{'  answer in the dialog below'}</Text>
               </Box>
             )}
-            {c.needsYou.map((ask, i) => (
-              <Box key={`ask-${i}`} flexDirection="column">
-                <Box>
-                  <Text color="warning">{'◆ '}</Text>
-                  <Text>{ask.question}</Text>
-                </Box>
-                <Box marginLeft={2} columnGap={1} flexWrap="wrap">
-                  {ask.options.map((option, j) => {
-                    const isPicked = v.picked[ask.question] === option
-                    return (
-                      <Button
-                        key={`ask-${i}-opt-${j}`}
-                        label={`${isPicked ? '✓ ' : ''}${clip(option, 24)}`}
-                        variant={isPicked ? 'primary' : undefined}
-                        onPress={() => pickAsk($, ask, option)}
-                      />
-                    )
-                  })}
-                  {!Input && <Button key={`ask-${i}-reply`} plain dimColor label="reply…" onPress={() => draftAsk($, ask)} />}
-                  <Button key={`ask-${i}-dismiss`} plain dimColor label="dismiss" onPress={() => dropAsk($, ask.question)} />
-                </Box>
-                {Input && (
-                  <Box marginLeft={2}>
-                    <Input
-                      key={`ask-${i}-input`}
-                      placeholder={ask.options.length > 0 ? 'or type an answer…' : 'type an answer…'}
-                      value={v.typed[ask.question] ?? ''}
-                      submitLabel={isMany ? undefined : 'send'}
-                      onInput={text => typeAsk($, ask, text)}
-                      onSubmit={text => submitTyped($, ask, text)}
-                    />
+            {c.needsYou.map((ask, i) => {
+              const isOpen = v.expanded === ask.question
+              const optionButton = (option: string, j: number, max: number) => {
+                const isPicked = v.picked[ask.question] === option
+                return (
+                  <Button
+                    key={`ask-${i}-opt-${j}`}
+                    label={`${isPicked ? '✓ ' : ''}${clip(option, max)}`}
+                    variant={isPicked ? 'primary' : undefined}
+                    onPress={() => pickAsk($, ask, option)}
+                  />
+                )
+              }
+              return (
+                <Box key={`ask-${i}`} flexDirection="column">
+                  <Box>
+                    <Text color="warning">{isOpen ? '▾ ' : '◆ '}</Text>
+                    <Text bold={isOpen}>{ask.question}</Text>
                   </Box>
-                )}
-              </Box>
-            ))}
-            {isMany && (
+                  {isOpen && ask.context && (
+                    <Box marginLeft={2}>
+                      <Text dimColor>{ask.context}</Text>
+                    </Box>
+                  )}
+                  {isOpen ? (
+                    <Box marginLeft={2} flexDirection="column">
+                      {ask.options.map((option, j) => (
+                        <Box key={`ask-${i}-row-${j}`} flexDirection="column">
+                          {optionButton(option, j, 80)}
+                          {ask.optionNotes[j] && (
+                            <Box marginLeft={2}>
+                              <Text dimColor>{ask.optionNotes[j]}</Text>
+                            </Box>
+                          )}
+                        </Box>
+                      ))}
+                    </Box>
+                  ) : (
+                    ask.options.length > 0 && (
+                      <Box marginLeft={2} columnGap={1} flexWrap="wrap">
+                        {ask.options.map((option, j) => optionButton(option, j, 28))}
+                      </Box>
+                    )
+                  )}
+                  {Input && (
+                    <Box marginLeft={2}>
+                      <Input
+                        key={`ask-${i}-input`}
+                        placeholder={ask.options.length > 0 ? 'or type an answer…' : 'type an answer…'}
+                        value={v.typed[ask.question] ?? ''}
+                        submitLabel={hasSend ? undefined : 'send'}
+                        onInput={text => typeAsk($, ask, text)}
+                        onSubmit={text => submitTyped($, ask, text)}
+                      />
+                    </Box>
+                  )}
+                  {isOpen && Input && (
+                    <Box marginLeft={2}>
+                      <Input
+                        key={`ask-${i}-details`}
+                        placeholder="extra details (optional)…"
+                        value={v.details[ask.question] ?? ''}
+                        onInput={text => detailAsk($, ask, text)}
+                        onSubmit={text => detailAsk($, ask, text)}
+                      />
+                    </Box>
+                  )}
+                  <Box marginLeft={2} columnGap={2}>
+                    <Button key={`ask-${i}-more`} plain dimColor label={isOpen ? 'less' : 'details'} onPress={() => toggleAsk($, ask)} />
+                    {!Input && <Button key={`ask-${i}-reply`} plain dimColor label="reply…" onPress={() => draftAsk($, ask)} />}
+                    <Button key={`ask-${i}-dismiss`} plain dimColor label="dismiss" onPress={() => dropAsk($, ask.question)} />
+                  </Box>
+                </Box>
+              )
+            })}
+            {hasSend && (
               <Box marginTop={1}>
                 <Button
                   key="send-answers"

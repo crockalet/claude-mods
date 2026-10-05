@@ -155,6 +155,43 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: 'Bump the major version?' })).toBeUndefined()
   })
 
+  test('an opened question shows its context and full options, and sends with extra details', async ($, on) => {
+    submitted.length = 0
+    const long = 'No, assume trip fares include tips and move on to the dashboard'
+    const reply = JSON.stringify({
+      task: 'Reconcile payouts',
+      needsYou: [
+        {
+          question: 'Run the megatron query to check payout_amount?',
+          context: 'Payouts look high; the query tells us whether tips are counted twice.',
+          options: [
+            { label: "Yes, I'll run it", description: 'You run it and paste the result back' },
+            { label: long, description: 'Skip the check and proceed' },
+          ],
+        },
+      ],
+    })
+    const { clock } = world(on, reply)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'check payouts', wait: false, origin: { kind: 'composer' } })
+    await $.turn.complete({ answer: 'Two ways to go.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+    submitted.length = 0
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ key: 'ask-0-opt-1', text: long })).toBeUndefined()
+    await ui.press({ key: 'ask-0-more' })
+    expect(await ui.find({ type: 'Text', text: /tips are counted twice/ })).toBeDefined()
+    expect(await ui.find({ key: 'ask-0-opt-1', text: long })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'You run it and paste the result back' })).toBeDefined()
+
+    await ui.press({ key: 'ask-0-opt-0' })
+    expect(submitted).toEqual([])
+    await ui.input({ key: 'ask-0-details', text: 'use the prod replica', kind: 'change' })
+    await ui.press({ key: 'send-answers' })
+    expect(submitted).toEqual([`Re: "Run the megatron query to check payout_amount?" — Yes, I'll run it (details: use the prod replica)`])
+  })
+
   test('a session with history but no breadcrumbs is backfilled from its transcript', async ($, on) => {
     const { clock } = world(on, JSON.stringify({ task: 'Add dark mode to settings', done: ['Added a theme toggle to SettingsScreen.tsx'] }))
     on('session.messages', () => ({

@@ -67,13 +67,33 @@ export const strings = (value: unknown, max: number, each = 100): string[] =>
 const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 // Older state.json files stored needs-you items as bare strings.
-export const asks = (value: unknown): { question: string; options: string[] }[] =>
+type RawAsk = { question: string; context?: unknown; options?: unknown; optionNotes?: unknown }
+type RawOption = { label: string; description?: unknown }
+
+const text = (value: unknown, max: number) => (typeof value === 'string' ? clip(value, max) : '')
+
+// Accepts every shape this has had: bare strings, string options, and {label, description} options.
+export const asks = (value: unknown): { question: string; context: string; options: string[]; optionNotes: string[] }[] =>
   Array.isArray(value)
     ? value
-        .map(v => (typeof v === 'string' ? { question: v, options: [] } : v))
-        .filter((v): v is { question: string; options?: unknown } => typeof v?.question === 'string' && v.question.trim() !== '')
+        .map(v => (typeof v === 'string' ? { question: v } : v))
+        .filter((v): v is RawAsk => typeof v?.question === 'string' && v.question.trim() !== '')
         .slice(0, 4)
-        .map(v => ({ question: clip(v.question, 80), options: strings(v.options, 4, 80) }))
+        .map(v => {
+          const notes = Array.isArray(v.optionNotes) ? v.optionNotes : []
+          const options = (Array.isArray(v.options) ? v.options : [])
+            .map((o, i): RawOption | null =>
+              typeof o === 'string' ? { label: o, description: notes[i] } : typeof o?.label === 'string' ? o : null,
+            )
+            .filter((o): o is RawOption => o !== null && o.label.trim() !== '')
+            .slice(0, 4)
+          return {
+            question: clip(v.question, 160),
+            context: text(v.context, 400),
+            options: options.map(o => clip(o.label, 80)),
+            optionNotes: options.map(o => text(o.description, 160)),
+          }
+        })
     : []
 
 export const parseStatus = (out: string) => {
