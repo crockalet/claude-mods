@@ -1,6 +1,9 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
+// The test runtime has timers; its types don't declare them.
+declare const setTimeout: (fn: () => void, ms: number) => unknown
+
 const NOW = Date.UTC(2026, 9, 5, 9, 0)
 const ROOT = '/home/dev/.agents/notes/acme-app/feat-sync'
 
@@ -17,6 +20,8 @@ const PANE = {
   },
 } as const
 
+const TESTS = { ...PANE, requestId: 'tests', props: { ...PANE.props, title: 'tests' } } as const
+
 const submitted: string[] = []
 
 const world = (on: On, reply = '{}', hasStore = false) => {
@@ -27,10 +32,19 @@ const world = (on: On, reply = '{}', hasStore = false) => {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__breadcrumbs__${e.name}` } }))
+  on('agent.register', ($, e) => ({ value: { agent: `breadcrumbs:${e.name}` } }))
+  on('agent.spawn', () => ({ model: 'sonnet' }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('classic.SessionStart', () => ({}))
+  on('ui.toast', () => ({ value: undefined }))
   on('session.id', () => ({ value: 'abc123def456' }))
   on('session.cwd', () => ({ value: '/code/feat-sync' }))
   on('session.repo', () => ({ value: { root: '/code/acme-app', remote: null, internal: false, name: null } }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
+    // A real `sleep 1` yields; an instant one would let a waiting step spin without ever yielding.
+    if (e.argv[0] === 'sleep') await new Promise<void>(resolve => setTimeout(resolve, 5))
     const out = e.argv.includes('--show-toplevel')
       ? '/code/feat-sync\n'
       : e.argv.includes('--show-current')
@@ -49,7 +63,11 @@ const world = (on: On, reply = '{}', hasStore = false) => {
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
   })
-  on('fs.list', () => ({ value: [] }))
+  on('fs.list', ($, e) => {
+    const prefix = `${e.path}/`
+    const names = new Set([...files.keys()].filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length).split('/')[0] ?? ''))
+    return { value: [...names].map(name => ({ name, kind: [...files.keys()].some(k => k.startsWith(`${prefix}${name}/`)) ? ('dir' as const) : ('file' as const), size: 0, mtimeMs: 0, isLink: false })) }
+  })
   on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
   on('model.complete', () => ({
     value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
@@ -57,7 +75,7 @@ const world = (on: On, reply = '{}', hasStore = false) => {
   on('turn.complete', () => ({ text: '' }))
   on('prompt.submit', ($, e) => {
     submitted.push(e.text)
-    return { text: e.text }
+    return { text: e.text, context: e.context }
   })
 
   return { files, clock }
@@ -89,6 +107,99 @@ describe('breadcrumbs', () => {
       expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
       await ui.unmount()
     }
+  })
+
+  test('a note table too wide for the pane is shown as a list, the file keeps the table', async ($, on) => {
+    const { files } = world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const wide = [
+      '| Need | Mod API piece | Already in breadcrumbs? |',
+      '|---|---|---|',
+      '| Claude lays out the test plan | `$.tool.register` → a test_plan tool | yes, same pattern as save_note |',
+    ].join('\n')
+    const narrow = '| a | b |\n|---|---|\n| 1 | 2 |'
+    await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Tables', markdown: `${wide}\n\n${narrow}` })
+    expect([...files.values()].some(t => t.includes('| Need | Mod API piece |'))).toBe(true)
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    const row = await ui.find({ type: 'Button', text: /Tables/ })
+    await ui.press({ key: row?.key ?? '' })
+    const body = await ui.find({ type: 'Markdown', text: /Claude lays out/ })
+    const text = String(body?.props.text ?? '')
+    expect(text).toContain('- Claude lays out the test plan\n  - *Mod API piece*: `$.tool.register` → a test_plan tool')
+    expect(text).not.toContain('| Need |')
+    expect(text).toContain('| a | b |')
+    await ui.unmount()
+  })
+
+  test('a test plan lists tests; a bare pass rides on the next prompt and a fail goes to Claude', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const listed = await $.tool.call({
+      tool: 'mcp__breadcrumbs__test_plan',
+      tests: [
+        { title: 'Login with SSO', steps: ['Open the app', 'Tap Sign in with Google'], expect: 'Lands on home' },
+        { title: 'Push while backgrounded', steps: ['Background the app'] },
+      ],
+    })
+    expect(listed.deny).toBeUndefined()
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    expect(await ui.find({ type: 'Text', text: /2 tests · 0 passed/ })).toBeDefined()
+    await ui.press({ key: 'test-1-row' })
+    expect(await ui.find({ type: 'Text', text: 'Tap Sign in with Google' })).toBeDefined()
+    await ui.press({ key: 'test-1-pass' })
+    expect(submitted).toEqual([])
+
+    await ui.press({ key: 'test-2-row' })
+    await ui.input({ key: 'test-2-input', text: 'no banner', kind: 'change' })
+    await ui.press({ key: 'test-2-fail' })
+    expect(submitted).toEqual(['[manual test 2 ✗] Push while backgrounded: no banner'])
+    expect(await ui.find({ type: 'Text', text: /1 passed · 1 failed/ })).toBeDefined()
+
+    const next = await $.prompt.submit({ text: 'fixed it', wait: false, origin: { kind: 'composer' } })
+    expect(next.context?.join('\n')).toContain('✓ test 1 Login with SSO')
+    await ui.unmount()
+  })
+
+  test('Start tester asks the main agent to spawn the tester, since a plugin-spawned agent gets no plugin hooks', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Push while backgrounded', steps: ['Background the app'] }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    await ui.press({ key: 'test-1-row' })
+    await ui.press({ key: 'test-1-start' })
+
+    expect(submitted).toHaveLength(1)
+    expect(submitted[0]).toContain('subagent_type "breadcrumbs:tester", run_in_background true')
+    expect(submitted[0]).toContain('Test 1: Push while backgrounded\n\nSteps:\n1. Background the app')
+    expect(await ui.find({ key: 'test-1-row', text: /● 1/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a step waits in the pane until Done and returns what the person typed', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Push while backgrounded', steps: ['Background the app'] }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+
+    const waiting = $.tool.call({ tool: 'mcp__breadcrumbs__await_user', id: '1', step: 1, instruction: 'Background the app' })
+    let card
+    for (let i = 0; i < 50 && !card; i++) card = await ui.find({ type: 'Button', text: 'Done' })
+    expect(await ui.find({ type: 'Text', text: /Waiting on you · 1/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '⏳ 1' })).toBeDefined()
+    await ui.input({ key: String(card?.key).replace(/-done$/, '-input'), text: 'banner showed', kind: 'change' })
+    await ui.press({ key: String(card?.key) })
+    expect((await waiting).result).toBe('The person answered: Done. banner showed')
+    expect(await ui.find({ type: 'Text', text: /Waiting on you/ })).toBeUndefined()
+
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '1', status: 'retest', note: 'Fixed the token refresh' })
+    expect(await ui.find({ type: 'Text', text: /claude: ⟳ Fixed the token refresh/ })).toBeDefined()
+    expect(submitted).toEqual([])
+    await ui.unmount()
   })
 
   test('a finished turn sets the task, decisions and last reply from the side pass', async ($, on) => {
@@ -229,6 +340,58 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Markdown', text: /Dark mode toggle added/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Added a theme toggle to SettingsScreen.tsx' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 file edited/ })).toBeDefined()
+  })
+
+  test('tests saved with a session come back on resume, without a tester or waiting step', async ($, on) => {
+    mock.store(on, { 'dir:abc123def456': '/old' })
+    const { files } = world(on, '{}', true)
+    const test = (id: string, status: string, agentId: string | null) => ({ id, title: `Test ${id}`, steps: [], expect: '', watch: '', status, agentId, log: [] })
+    const tests = { tests: [test('1', 'passed', null), test('2', 'running', 'gone')], waits: [{ id: 'w', testId: '2', step: 1, instruction: 'Tap', at: NOW, answer: null }], unreported: [] }
+    const old = { tasks: [{ title: 'Old task', at: NOW }], prompts: [], notes: [], session: 'abc123def456', worktree: '/code/feat-sync', updatedAt: NOW }
+    files.set('/old/state.json', JSON.stringify(old))
+    files.set('/old/tests.json', JSON.stringify(tests))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    expect(await ui.find({ key: 'test-1-row', text: /✓ 1 Test 1/ })).toBeDefined()
+    expect(await ui.find({ key: 'test-2-row', text: /· 2 Test 2/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Waiting on you/ })).toBeUndefined()
+  })
+
+  test('tests come back on resume even when the breadcrumbs state survived', async ($, on) => {
+    mock.store(on, { 'dir:abc123def456': '/old' })
+    const { files } = world(on, '{}', true)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Kept', markdown: 'Still here.' })
+    const test = { id: '4', title: 'Survives a restart', steps: [], expect: '', watch: '', status: 'todo', agentId: null, log: [] }
+    files.set('/old/tests.json', JSON.stringify({ tests: [test], waits: [], unreported: [] }))
+    // A turn ending with an empty live list must not touch the saved one.
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't9', reason: 'answer' })
+    expect(files.get('/old/tests.json')).toContain('Survives a restart')
+
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    expect(await ui.find({ key: 'test-4-row', text: /Survives a restart/ })).toBeDefined()
+  })
+
+  test('a session resumed under a new id finds its folder by its transcript', async ($, on) => {
+    const { files, clock } = world(on)
+    const mine = '2026-10-05-run-the-tests-abc000'
+    const other = '2026-10-05-something-else-xyz000'
+    const saved = (title: string, transcript: string) =>
+      JSON.stringify({ tasks: [{ title, at: NOW }], prompts: [], notes: [], session: 'old', worktree: '/code/feat-sync', updatedAt: NOW, transcript })
+    files.set(`${ROOT}/${mine}/state.json`, saved('Run the tests', '/t/first.jsonl'))
+    files.set(`${ROOT}/${other}/state.json`, saved('Something else', '/t/other.jsonl'))
+    const test = { id: '4', title: 'Survives a restart', steps: [], expect: '', watch: '', status: 'passed', agentId: null, log: [] }
+    files.set(`${ROOT}/${mine}/tests.json`, JSON.stringify({ tests: [test], waits: [], unreported: [] }))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.classic.SessionStart({ source: 'resume', transcript_path: '/t/first.jsonl' })
+    await clock.settle()
+
+    const tests = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    expect(await tests.find({ key: 'test-4-row', text: /✓ 4 Survives a restart/ })).toBeDefined()
+    const crumbs = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await crumbs.find({ type: 'Text', text: 'Run the tests' })).toBeDefined()
   })
 
   test('state written by an older version still draws', async ($, on) => {

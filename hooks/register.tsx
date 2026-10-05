@@ -1,11 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
-import type { Ask, Crumbs, Note, Repo, View, Where } from '../types'
+import type { Ask, Crumbs, Entry, ManualTest, Note, Repo, TestRun, TestStatus, TestsView, View, Wait, Where } from '../types'
 import { contextMarkdown, repoState } from './markdown'
 import { normalize } from './state'
+import { ICON, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, str, testOf } from './tests'
 import type { Saved } from './markdown'
-import { ago, asks, basename, cdTarget, clip, day, head, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
+import { ago, asks, basename, cdTarget, clip, day, head, narrowTables, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
 const SAVE_NOTE = 'mcp__breadcrumbs__save_note'
@@ -24,12 +25,15 @@ const VIEW: View = {
 }
 const view = atom({ plugin: 'breadcrumbs', key: 'view' } as const, VIEW)
 const pending = atom({ plugin: 'breadcrumbs', key: 'pending' } as const, null)
+const testRun = atom({ plugin: 'breadcrumbs', key: 'tests' } as const, { tests: [], waits: [], unreported: [] })
+const testsView = atom({ plugin: 'breadcrumbs', key: 'testsView' } as const, { expanded: null, typed: {} })
 
 const NOTE_GUIDANCE = [
   'The user keeps a "breadcrumbs" pane open beside this session.',
   `When the user asks for an explanation, a summary, a walkthrough or a comparison, write it with the ${SAVE_NOTE} tool`,
   '(a short title and the full markdown body) instead of only in your reply, then reply with one line saying it is saved in the breadcrumbs pane.',
   'Keep doing any task the same message asked for. Do not save notes for status updates or for answers of a sentence or two.',
+  'The pane is only about 50 columns wide: write notes as headings, short paragraphs and lists, avoid tables, and keep code and diagram lines under 50 characters.',
 ].join(' ')
 
 type $ = EngineInterface
@@ -207,6 +211,8 @@ const cfg = { model: 'haiku', retentionDays: 30, archiveDays: 60, isArchiving: t
 
 let sessionId = ''
 let dir: string | null = null
+// Identifies the conversation across a resume, which starts it under a new session id but keeps its transcript.
+let transcript: string | null = null
 let turnTools: string[] = []
 let hasSavedNote = false
 
@@ -225,7 +231,7 @@ const save = async ($: $, status: string) => {
   const place = await read($, where)
   if (!place || (state.tasks.length === 0 && state.notes.length === 0)) return
   const target = await ensureDir($, state.tasks[0]?.title ?? 'session')
-  const saved: Saved = { ...state, session: sessionId, worktree: place.worktree, updatedAt: await $.clock.now() }
+  const saved: Saved = { ...state, session: sessionId, worktree: place.worktree, updatedAt: await $.clock.now(), ...(transcript ? { transcript } : {}) }
   await persist($, target, saved, place, status)
 }
 
@@ -364,6 +370,47 @@ const track = async ($: $, e: Record<string, unknown>) => {
 const isTyped = (m: SessionMessage) =>
   m.role === 'user' && m.text.trim() !== '' && !m.toolResults?.length && !m.text.trimStart().startsWith('<')
 
+// The newest session folder in this worktree that holds the same conversation, by its transcript.
+const findResumed = async ($: $, wtDir: string, path: string): Promise<string | null> => {
+  let best: { dir: string; at: number } | null = null
+  for (const entry of await dirs($, wtDir)) {
+    const saved = await readSaved($, `${wtDir}/${entry.name}`)
+    if (saved?.transcript === path && (!best || saved.updatedAt > best.at)) best = { dir: `${wtDir}/${entry.name}`, at: saved.updatedAt }
+  }
+
+  return best?.dir ?? null
+}
+
+const restoreFrom = async ($: $, from: string) => {
+  const current = await readCrumbs($)
+  const saved = await readSaved($, from)
+  if (saved && current.tasks.length === 0 && current.notes.length === 0) {
+    const { session: _s, worktree: _w, updatedAt: _u, transcript: _t, ...restored } = saved
+    await mutate($, () => ({ ...normalize(restored), activity: null, asking: null }))
+  }
+  // Restored on its own: on a reload the breadcrumbs state can survive while the test list doesn't.
+  const savedTests = await readTests($, from)
+  if (savedTests && (await read($, testRun)).tests.length === 0) {
+    // A tester or a waiting step doesn't outlive its session.
+    await update($, testRun, () => ({
+      tests: savedTests.tests.map(t => ({ ...t, status: t.status === 'running' ? 'todo' : t.status, agentId: null })),
+      waits: [],
+      unreported: savedTests.unreported,
+    }))
+  }
+}
+
+// A resumed conversation starts under a new session id, so its folder is found by its transcript.
+const adoptResumed = async ($: $, path: string) => {
+  transcript = path
+  const place = (await read($, where)) ?? (await locate($))
+  const found = dir ? null : await findResumed($, worktreeDir(await notesRoot($), place), path)
+  if (!found) return
+  dir = found
+  await $.store.set(`dir:${sessionId}`, found)
+  await restoreFrom($, found)
+}
+
 // A session that was running before the mod was installed has history but no breadcrumbs yet.
 const backfill = async ($: $) => {
   const current = await readCrumbs($)
@@ -481,6 +528,223 @@ const draftAsk = async ($: $, ask: Ask) => {
   $.ui.toast('Finish your answer in the prompt box')
 }
 
+const readRun = ($: $): Promise<TestRun> => read($, testRun)
+
+// Kept in its own file and written only when a test changes, so a turn's save never rewrites it from an empty live list.
+const mutateTests = async ($: $, fn: (r: TestRun) => TestRun) => {
+  await update($, testRun, fn)
+  const state = await readCrumbs($)
+  const target = await ensureDir($, state.tasks[0]?.title ?? 'tests')
+  await $.fs.write(`${target}/tests.json`, JSON.stringify(await read($, testRun), null, 2))
+}
+
+const readTests = async ($: $, dir: string): Promise<TestRun | null> => {
+  try {
+    return JSON.parse(await $.fs.read(`${dir}/tests.json`)) as TestRun
+  } catch {
+    return null
+  }
+}
+
+const setTestsView = ($: $, fn: (v: TestsView) => TestsView) => update($, testsView, fn)
+
+const patchTest = ($: $, id: string, fn: (t: ManualTest) => ManualTest) =>
+  mutateTests($, r => ({ ...r, tests: r.tests.map(t => (t.id === id ? fn(t) : t)) }))
+
+const logTest = async ($: $, id: string, from: Entry['from'], text: string) => {
+  const at = await $.clock.now()
+  await patchTest($, id, t => ({ ...t, log: [...t.log, { from, text: clip(text, 400), at }].slice(-30) }))
+}
+
+const showWaiting = async ($: $) => {
+  const open = (await readRun($)).waits.filter(w => w.answer === null).length
+  $.ui.status(open > 0 ? `⏳ ${open} test step${open > 1 ? 's' : ''} waiting on you` : undefined)
+}
+
+// A hook's own state reads don't see writes made while it runs, so a waiting step polls this instead.
+const answered = new Map<string, string>()
+
+const answerWait = async ($: $, waitId: string, answer: string) => {
+  answered.set(waitId, answer)
+  await mutateTests($, r => ({ ...r, waits: r.waits.map(w => (w.id === waitId ? { ...w, answer } : w)) }))
+  await showWaiting($)
+}
+
+// Where a message about a test goes: the step it is waiting on, its live tester, or the main agent.
+const routeTest = async ($: $, t: ManualTest, message: string, forMain: string) => {
+  const r = await readRun($)
+  const wait = openWait(r, t.id)
+  if (wait) return answerWait($, wait.id, message)
+  if (isLive(t) && t.agentId) {
+    await $.session.send({ to: { agentId: t.agentId }, text: message })
+    return
+  }
+  await $.prompt.submit({ text: forMain, asUser: true })
+}
+
+const replyTest = async ($: $, t: ManualTest, typed: string) => {
+  const message = typed.trim()
+  if (!message) return
+  await logTest($, t.id, 'you', message)
+  await setTestsView($, v => ({ ...v, typed: { ...v.typed, [t.id]: '' } }))
+  await routeTest($, t, message, `[manual test ${t.id} · ${t.title}] ${message}`)
+}
+
+const markTest = async ($: $, t: ManualTest, status: 'passed' | 'failed', typed: string) => {
+  const why = typed.trim()
+  await patchTest($, t.id, old => ({ ...old, status }))
+  await logTest($, t.id, 'you', `${status === 'passed' ? '✓ passed' : '✗ failed'}${why ? `: ${why}` : ''}`)
+  await setTestsView($, v => ({ ...v, typed: { ...v.typed, [t.id]: '' } }))
+  const line = `${ICON[status]} test ${t.id} ${t.title}${why ? `: ${why}` : ''}`
+  const r = await readRun($)
+  if (openWait(r, t.id) || isLive(t)) {
+    await routeTest($, t, `The person marked this test ${status}${why ? `: ${why}` : ''}. Wrap up.`, line)
+    return
+  }
+  // A pass with nothing to logTest waits for the next prompt instead of costing a turn.
+  if (status === 'passed' && !why) {
+    await mutateTests($, old => ({ ...old, unreported: [...old.unreported, line] }))
+    return
+  }
+  await $.prompt.submit({ text: `[manual test ${t.id} ${ICON[status]}] ${t.title}${why ? `: ${why}` : ''}`, asUser: true })
+}
+
+const startTester = async ($: $, t: ManualTest) => {
+  const prompt = [
+    `Test ${t.id}: ${t.title}`,
+    t.steps.length > 0 ? `Steps:\n${t.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : '',
+    t.expect ? `Expected: ${t.expect}` : '',
+    t.watch ? `Follow along with: ${t.watch}` : '',
+    t.log.length > 0 ? `Earlier on this test:\n${t.log.map(l => `- ${l.from}: ${l.text}`).join('\n')}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+  // Plugin hooks don't run inside an agent a plugin spawns, so the tester's own tool calls would go unanswered; the main agent spawns it instead.
+  await patchTest($, t.id, old => ({ ...old, status: 'running', agentId: null }))
+  await setTestsView($, v => ({ ...v, expanded: t.id }))
+  await $.prompt.submit({
+    text: [
+      `Start the tester for manual test ${t.id}: call the Agent tool with subagent_type "${TESTER}", run_in_background true, description "${clip(`Test ${t.id}: ${t.title}`, 40)}" and exactly this prompt. Then end your turn without walking the user through the test yourself.`,
+      '',
+      prompt,
+    ].join('\n'),
+  })
+}
+
+// Links a tester the main agent spawned to its test, by the "Test <id>:" line its prompt opens with.
+const bindTester = async ($: $, prompt: string, agentId: string) => {
+  const id = /^Test (\S+):/.exec(prompt.trim())?.[1]
+  if (!id) return
+  await patchTest($, id, old => ({ ...old, status: 'running', agentId }))
+}
+
+const planTests = async ($: $, e: Record<string, unknown>) => {
+  const raw = Array.isArray(e.tests) ? (e.tests as Record<string, unknown>[]) : []
+  const isAppending = e.mode === 'append'
+  const r = await readRun($)
+  const kept = isAppending ? r.tests : []
+  const incoming: ManualTest[] = raw
+    .filter(t => str(t?.title))
+    .map((t, i) => ({
+      id: str(t.id) || String(kept.length + i + 1),
+      title: clip(str(t.title), 60),
+      steps: listOf(t.steps),
+      expect: str(t.expect),
+      watch: str(t.watch),
+      status: 'todo',
+      agentId: null,
+      log: [],
+    }))
+  if (incoming.length === 0) return { deny: 'test_plan needs at least one test with a title.' }
+  const ids = new Set(incoming.map(t => t.id))
+  await mutateTests($, old => ({
+    ...old,
+    tests: [...kept.filter(t => !ids.has(t.id)), ...incoming],
+    waits: isAppending ? old.waits : [],
+    unreported: isAppending ? old.unreported : [],
+  }))
+  void $.ui.open({ id: TESTS_PANE, title: 'tests' })
+
+  return {
+    result: `Listed ${incoming.length} test(s) in the tests pane (/tests). The user starts each one there; a tester subagent guides them and its final report reaches you when it finishes. Tell the user in one line that the tests are in the pane.`,
+  }
+}
+
+const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string }) => {
+  const t = testOf(await readRun($), e)
+  if (!t) return { deny: 'No such test: pass the id from test_plan.' }
+  const status = STATUSES.find(s => s === e.status)
+  const note = str(e.note)
+  const steps = listOf(e.steps)
+  await patchTest($, t.id, old => ({ ...old, status: status ?? old.status, steps: steps.length > 0 ? steps : old.steps }))
+  if (note || status) await logTest($, t.id, e.agentId === undefined ? 'claude' : 'tester', `${status && status !== t.status ? `${ICON[status]} ` : ''}${note || status}`)
+
+  return { result: `Updated test ${t.id}.` }
+}
+
+const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }, signal: AbortSignal) => {
+  const instruction = str(e.instruction)
+  if (!instruction) return { deny: 'await_user needs an instruction.' }
+  const t = testOf(await readRun($), e)
+  const now = await $.clock.now()
+  const wait: Wait = {
+    id: `${now}-${Math.random().toString(36).slice(2, 7)}`,
+    testId: t?.id ?? null,
+    step: typeof e.step === 'number' ? e.step : null,
+    instruction: clip(instruction, 200),
+    at: now,
+    answer: null,
+  }
+  await mutateTests($, r => ({ ...r, waits: [...r.waits.filter(w => w.answer === null || w.testId !== wait.testId), wait] }))
+  if (t) await setTestsView($, v => ({ ...v, expanded: t.id }))
+  await showWaiting($)
+  $.ui.toast(t ? `Test ${t.id} is waiting on you` : 'A test step is waiting on you')
+
+  // Waiting on a button inside the hook counts against its budget; time inside a $ call does not.
+  let answer: string | null = null
+  while (answer === null && !signal.aborted && (await $.clock.now()) - now < WAIT_LIMIT_MS) {
+    await $.process.run(['sleep', '1'])
+    answer = answered.get(wait.id) ?? null
+  }
+  answered.delete(wait.id)
+  await mutateTests($, r => ({ ...r, waits: r.waits.filter(w => w.id !== wait.id) }))
+  await showWaiting($)
+  if (answer === null) {
+    return { result: signal.aborted ? 'Interrupted before the person answered.' : 'No answer after 30 minutes. Ask again, or end the test as blocked.' }
+  }
+
+  return { result: `The person answered: ${answer}` }
+}
+
+const testerDone = async ($: $, agentId: string, answer: string, isAborted: boolean) => {
+  const t = (await readRun($)).tests.find(x => x.agentId === agentId)
+  if (!t) return
+  const status: TestStatus = t.status === 'running' ? 'todo' : t.status
+  await patchTest($, t.id, old => ({ ...old, status, agentId: null }))
+  await mutateTests($, r => ({ ...r, waits: r.waits.filter(w => w.testId !== t.id || w.answer !== null) }))
+  await showWaiting($)
+  // Claude Code hands the tester's final report to the main agent itself; the pane just records it.
+  await logTest($, t.id, 'tester', answer || (isAborted ? 'stopped before it reported' : 'ended without a summary'))
+}
+
+const TEST_TOOLS = [TOOL('test_plan'), TOOL('test_update'), TOOL('await_user')]
+
+const testTool = async ($: $, e: Record<string, unknown> & { tool: unknown; agentId?: string }, signal: AbortSignal) => {
+  if (e.tool === TOOL('test_plan')) return planTests($, e)
+  if (e.tool === TOOL('test_update')) return updateTest($, e)
+
+  return awaitUser($, e, signal)
+}
+
+// Passes with nothing to say ride along with the next prompt instead of costing a turn each.
+const takePasses = async ($: $): Promise<string | null> => {
+  const { unreported } = await readRun($)
+  if (unreported.length === 0) return null
+  await mutateTests($, r => ({ ...r, unreported: [] }))
+
+  return `Manual tests the user passed since your last turn:\n${unreported.join('\n')}`
+}
+
 export const register: Register = (on, options) => {
   cfg.model = String(options.model ?? 'haiku')
   cfg.retentionDays = Number(options.retentionDays ?? 30)
@@ -495,14 +759,7 @@ export const register: Register = (on, options) => {
 
     const known = await $.store.get(`dir:${sessionId}`)
     dir = typeof known === 'string' ? known : null
-    const current = await readCrumbs($)
-    if (dir && current.tasks.length === 0 && current.notes.length === 0) {
-      const saved = await readSaved($, dir)
-      if (saved) {
-        const { session: _s, worktree: _w, updatedAt: _u, ...restored } = saved
-        await mutate($, () => ({ ...normalize(restored), activity: null, asking: null }))
-      }
-    }
+    if (dir) await restoreFrom($, dir)
 
     await $.command.register({
       name: 'whereami',
@@ -511,7 +768,7 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'save_note',
       description:
-        'Save an explanation, summary or walkthrough the user asked for as a markdown note in their breadcrumbs pane, so it does not get buried in the transcript.',
+        'Save an explanation, summary or walkthrough the user asked for as a markdown note in their breadcrumbs pane, so it does not get buried in the transcript. The pane is about 50 columns wide, so prefer lists to tables.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -521,6 +778,69 @@ export const register: Register = (on, options) => {
         required: ['title', 'markdown'],
       },
     })
+    await $.command.register({ name: 'tests', description: 'Show or hide the manual tests pane' })
+    try {
+      await $.agent.register({
+        name: 'tester',
+        description: 'Guides the person through one manual end-to-end test. Spawn it only when the tests pane asks you to, with the prompt it gives.',
+        prompt: TESTER_PROMPT,
+      })
+    } catch (error) {
+      // Without the tester the rest of the pane still works; Start reports the missing agent.
+      $.ui.log(`breadcrumbs: tester agent not registered (${error instanceof Error ? error.message : String(error)})`)
+    }
+    await $.tool.register({
+      name: 'test_plan',
+      description: 'List manual or end-to-end tests the user has to run by hand in their tests pane, each with its steps. The user starts each test from the pane.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tests: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Short id, e.g. "1"; defaults to its position' },
+                title: { type: 'string', description: 'Under 40 characters' },
+                steps: { type: 'array', items: { type: 'string' }, description: 'What the person does, each under 70 characters' },
+                expect: { type: 'string', description: 'What should happen' },
+                watch: { type: 'string', description: 'Logs or watchers to follow along with' },
+              },
+              required: ['title'],
+            },
+          },
+          mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) starts a new list' },
+        },
+        required: ['tests'],
+      },
+    })
+    await $.tool.register({
+      name: 'test_update',
+      description: 'Change a manual test: its status (todo, running, passed, failed, blocked, retest), a short note shown in the pane, or new steps.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The test id; a tester may leave it out' },
+          status: { type: 'string', enum: [...STATUSES] },
+          note: { type: 'string', description: 'One line' },
+          steps: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    })
+    await $.tool.register({
+      name: 'await_user',
+      description: 'Show the person a step to do by hand in the tests pane and wait until they press Done, Can\'t or reply. Returns their answer.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The test id; a tester may leave it out' },
+          step: { type: 'number' },
+          instruction: { type: 'string', description: 'What to do, under 100 characters' },
+        },
+        required: ['instruction'],
+      },
+    })
+    await showWaiting($)
 
     if (e.isInteractive && options.panel !== 'command') void $.ui.open({ id: PANE, title: 'breadcrumbs' })
     $.clock.every(30_000, () => $.ui.invalidate('ui.render'))
@@ -544,10 +864,23 @@ export const register: Register = (on, options) => {
     return started
   })
 
+  on('classic.SessionStart', async ($, e, next) => {
+    const done = await next(e)
+    if (e.transcript_path) await adoptResumed($, e.transcript_path)
+
+    return done
+  })
+
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
 
-    return { sections: [...composed.sections, { id: 'breadcrumbs:notes', text: NOTE_GUIDANCE, scope: 'session' }] }
+    return {
+      sections: [
+        ...composed.sections,
+        { id: 'breadcrumbs:notes', text: NOTE_GUIDANCE, scope: 'session' },
+        { id: 'breadcrumbs:tests', text: TESTS_GUIDANCE, scope: 'session' },
+      ],
+    }
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -562,9 +895,21 @@ export const register: Register = (on, options) => {
         hasSavedNote = false
       }
     }
+    const passes = await takePasses($)
 
-    return next(e)
+    return next(passes ? { ...e, context: [...(e.context ?? []), passes] } : e)
   })
+
+  // A subagent's call to a plugin tool is answered only by a hook matched on that tool.
+  for (const tool of TEST_TOOLS) {
+    on('tool.call', { tool: tool as typeof SAVE_NOTE }, async ($, e, next) => {
+      try {
+        return await testTool($, e as Record<string, unknown> & { tool: unknown; agentId?: string }, next.signal)
+      } catch (error) {
+        return { deny: `breadcrumbs: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    })
+  }
 
   on('tool.call', { tool: SAVE_NOTE }, async ($, e) => {
     const title = typeof e.title === 'string' ? e.title : 'Note'
@@ -577,7 +922,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
-    if (e.agentId !== undefined || String(e.tool) === SAVE_NOTE) return next(e)
+    if (e.agentId !== undefined || String(e.tool) === SAVE_NOTE || TEST_TOOLS.includes(String(e.tool))) return next(e)
     const label = toolLabel(String(e.tool), e as Record<string, unknown>)
     turnTools.push(label)
     if (e.tool !== 'AskUserQuestion') {
@@ -597,7 +942,10 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId !== undefined) return done
+    if (e.agentId !== undefined) {
+      await testerDone($, e.agentId, e.answer.trim(), e.isAborted)
+      return done
+    }
 
     await refreshRepos($)
     const now = await $.clock.now()
@@ -830,7 +1178,7 @@ export const register: Register = (on, options) => {
               <Box>
                 <Text dimColor>{'⎿ '}</Text>
                 <Box flexShrink={1}>
-                  <Markdown key="last-said" dimColor text={head(c.lastSaid.text, width * 4)} />
+                  <Markdown key="last-said" dimColor text={head(narrowTables(c.lastSaid.text, width - 2), width * 4)} />
                 </Box>
               </Box>
             )}
@@ -898,7 +1246,7 @@ export const register: Register = (on, options) => {
             ))}
             {open && (
               <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
-                <Markdown key="note-body" text={openText} />
+                <Markdown key="note-body" text={narrowTables(openText, width - 4)} />
                 <Box gap={2}>
                   {!open.isPinned && <Button key="pin" label="Pin" onPress={() => pin($, open)} />}
                   <Button key="close-note" label="Close" onPress={set({ openNote: null })} />
@@ -935,6 +1283,152 @@ export const register: Register = (on, options) => {
             )}
           </Box>
         )}
+      </Box>
+    )
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    if (e.subagentType !== TESTER) return next(e)
+    // The tester waits on the person for minutes; the main agent must not block on it.
+    const spawned = await next({ ...e, background: true })
+    if (spawned.deny === undefined && spawned.agentId) await bindTester($, e.prompt, spawned.agentId)
+
+    return spawned
+  })
+
+  on('command.run', { command: 'tests' }, async $ => {
+    if ((await $.ui.panes()).some(p => p.id === TESTS_PANE)) {
+      await $.ui.close({ id: TESTS_PANE })
+      return { text: 'Tests pane hidden.' }
+    }
+    await $.ui.open({ id: TESTS_PANE, title: 'tests' })
+
+    return { text: 'Tests pane shown.' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: TESTS_PANE }, async ($, e) => {
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button } = elements
+    const Input = 'Input' in elements ? elements.Input : undefined
+    const r = await readRun($)
+    const v = await read($, testsView)
+    const width = Math.max(20, e.props.bodyColumns)
+    const waits = r.waits.filter(w => w.answer === null)
+    const passed = r.tests.filter(t => t.status === 'passed').length
+    const failed = r.tests.filter(t => t.status === 'failed').length
+    const typed = (id: string) => v.typed[id] ?? ''
+    const type = (id: string) => (value: string) => setTestsView($, old => ({ ...old, typed: { ...old.typed, [id]: value } }))
+
+    if (r.tests.length === 0 && waits.length === 0) {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>No manual tests yet.</Text>
+          <Text dimColor>Ask Claude for a manual test planTests and it lists the tests here.</Text>
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text dimColor>
+          {r.tests.length} tests · {passed} passed{failed > 0 ? ` · ${failed} failed` : ''}
+        </Text>
+
+        {waits.length > 0 && (
+          <Box flexDirection="column">
+            <Text color="warning">Waiting on you · {waits.length}</Text>
+            {waits.map(w => {
+              const t = r.tests.find(x => x.id === w.testId)
+              const key = `wait-${w.id}`
+              return (
+                <Box key={key} flexDirection="column">
+                  <Box>
+                    <Text color="warning">{'◆ '}</Text>
+                    <Text bold wrap="truncate-end">
+                      {t ? `${t.id} ${t.title}` : 'Step'}
+                      {w.step !== null ? ` · step ${w.step}` : ''}
+                    </Text>
+                  </Box>
+                  <Box marginLeft={2} flexDirection="column">
+                    <Text>{w.instruction}</Text>
+                    <Box columnGap={1} flexWrap="wrap">
+                      <Button key={`${key}-done`} variant="primary" label="Done" onPress={() => answerWait($, w.id, typed(key).trim() ? `Done. ${typed(key).trim()}` : 'Done.')} />
+                      <Button key={`${key}-cant`} label="Can't" onPress={() => answerWait($, w.id, `Can't do this step.${typed(key).trim() ? ` ${typed(key).trim()}` : ''}`)} />
+                    </Box>
+                    {Input && (
+                      <Input
+                        key={`${key}-input`}
+                        placeholder="reply…"
+                        value={typed(key)}
+                        submitLabel="send"
+                        onInput={type(key)}
+                        onSubmit={value => (value.trim() ? answerWait($, w.id, value.trim()) : undefined)}
+                      />
+                    )}
+                  </Box>
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+
+        <Box flexDirection="column">
+          {r.tests.map(t => {
+            const isOpen = v.expanded === t.id
+            const wait = openWait(r, t.id)
+            return (
+              <Box key={`test-${t.id}`} flexDirection="column">
+                <Box justifyContent="space-between">
+                  <Button
+                    key={`test-${t.id}-row`}
+                    plain
+                    label={`${isOpen ? '▾' : '▸'} ${ICON[t.status]} ${t.id} ${clip(t.title, width - 14)}`}
+                    onPress={() => setTestsView($, old => ({ ...old, expanded: isOpen ? null : t.id }))}
+                  />
+                  {wait && <Text color="warning">{wait.step !== null ? `⏳ ${wait.step}` : '⏳'}</Text>}
+                </Box>
+                {isOpen && (
+                  <Box marginLeft={2} flexDirection="column">
+                    {t.status === 'running' && <Text color="claude">● tester running</Text>}
+                    {t.watch && <Text dimColor>watch: {t.watch}</Text>}
+                    {t.steps.map((s, i) => (
+                      <Box key={`test-${t.id}-step-${i}`}>
+                        <Text dimColor={wait?.step !== null && wait?.step !== undefined && wait.step !== i + 1}>{`${i + 1}. `}</Text>
+                        <Text bold={wait?.step === i + 1}>{s}</Text>
+                      </Box>
+                    ))}
+                    {t.expect && <Text dimColor>expect: {t.expect}</Text>}
+                    {t.log.slice(-6).map((l, i) => (
+                      <Box key={`test-${t.id}-log-${i}`}>
+                        <Text dimColor>{'↳ '}</Text>
+                        <Text color={l.from === 'you' ? undefined : 'claude'} dimColor={l.from === 'you'}>
+                          {l.from}: {l.text}
+                        </Text>
+                      </Box>
+                    ))}
+                    {Input && (
+                      <Input
+                        key={`test-${t.id}-input`}
+                        placeholder={wait ? 'answer the step…' : t.status === 'running' ? 'tell the tester…' : 'feedback for Claude…'}
+                        value={typed(t.id)}
+                        submitLabel="send"
+                        onInput={type(t.id)}
+                        onSubmit={value => replyTest($, t, value)}
+                      />
+                    )}
+                    <Box columnGap={1} flexWrap="wrap">
+                      <Button key={`test-${t.id}-pass`} label="Pass" onPress={() => markTest($, t, 'passed', typed(t.id))} />
+                      <Button key={`test-${t.id}-fail`} label="Fail" onPress={() => markTest($, t, 'failed', typed(t.id))} />
+                      {t.status !== 'running' && (
+                        <Button key={`test-${t.id}-start`} variant="primary" label={t.log.length > 0 ? 'Restart tester' : 'Start tester'} onPress={() => startTester($, t)} />
+                      )}
+                    </Box>
+                  </Box>
+                )}
+              </Box>
+            )
+          })}
+        </Box>
       </Box>
     )
   })

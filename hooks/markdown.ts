@@ -2,7 +2,7 @@ import type { Crumbs, Where } from '../types'
 import type { Repo } from '../types'
 import { asks, basename, stamp } from './text'
 
-export type Saved = Crumbs & { session: string; worktree: string; updatedAt: number }
+export type Saved = Crumbs & { session: string; worktree: string; updatedAt: number; transcript?: string }
 
 export const repoState = (r: Repo): string => {
   const parts: string[] = []

@@ -56,8 +56,43 @@ export type View = {
   expanded: string | null
 }
 
+export type TestStatus = 'todo' | 'running' | 'passed' | 'failed' | 'blocked' | 'retest'
+
+export type Entry = { from: 'you' | 'tester' | 'claude'; text: string; at: number }
+
+export type ManualTest = {
+  id: string
+  title: string
+  steps: string[]
+  expect: string
+  watch: string
+  status: TestStatus
+  agentId: string | null
+  log: Entry[]
+}
+
+export type Wait = {
+  id: string
+  testId: string | null
+  step: number | null
+  instruction: string
+  at: number
+  answer: string | null
+}
+
+export type TestRun = { tests: ManualTest[]; waits: Wait[]; unreported: string[] }
+
+export type TestsView = { expanded: string | null; typed: Record<string, string> }
+
 declare module 'claude-code' {
   interface PluginState {
-    breadcrumbs: { crumbs: Crumbs; where: Where | null; view: View; pending: string | null }
+    breadcrumbs: {
+      crumbs: Crumbs
+      where: Where | null
+      view: View
+      pending: string | null
+      tests: TestRun
+      testsView: TestsView
+    }
   }
 }

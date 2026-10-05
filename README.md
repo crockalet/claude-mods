@@ -19,6 +19,14 @@ Mods need Claude Code 2.1.287 or later.
 
 `/whereami` shows or hides the pane. It opens by itself at 144+ columns.
 
+## Manual tests
+
+When you need to run tests by hand, Claude lists them in a second pane (`/tests`) with their steps. **Start tester** hands one test to a tester subagent that walks you through it, follows the logs while you go, and sends its final report to the main session, so the main agent stays the orchestrator.
+
+- Steps a tester is waiting on sit under **Waiting on you** with Done / Can't / a reply, and the status line counts them.
+- Feedback typed on a test goes to the step it's waiting on, else its running tester, else Claude.
+- A bare Pass costs no turn; it rides along with your next prompt.
+
 ## Files
 
 Notes live outside your repos, one folder per session:

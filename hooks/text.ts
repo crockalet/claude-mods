@@ -1,4 +1,4 @@
-export const slug = (text: string, max = 40): string =>
+export const slug =(text: string, max = 40): string =>
   text
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -16,7 +16,47 @@ export const clip = (text: string, max: number): string => {
 export const head = (text: string, max: number): string =>
   text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`
 
-export const ago = (at: number, now: number): string => {
+const cells = (row: string) =>
+  row
+    .trim()
+    .replace(/^\||\|$/g, '')
+    .split(/(?<!\\)\|/)
+    .map(c => c.trim())
+
+const isRule = (row: string) => /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(row) && row.includes('-')
+
+// A table wider than the pane wraps into an unreadable grid, so the preview restacks it as a list.
+export const narrowTables = (markdown: string, width: number): string => {
+  const lines = markdown.split('\n')
+  const out: string[] = []
+  let isFenced = false
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    if (/^\s*(```|~~~)/.test(line)) isFenced = !isFenced
+    if (isFenced || !line.includes('|') || !isRule(lines[i + 1] ?? '')) {
+      out.push(line)
+      continue
+    }
+    let end = i + 2
+    while (end < lines.length && (lines[end] ?? '').includes('|') && (lines[end] ?? '').trim()) end++
+    const header = cells(line)
+    const rows = lines.slice(i + 2, end).map(cells)
+    const widths = header.map((h, k) => Math.max(h.length, ...rows.map(r => (r[k] ?? '').length)))
+    if (widths.reduce((sum, w) => sum + w + 3, 1) <= width) {
+      out.push(...lines.slice(i, end))
+    } else {
+      for (const row of rows) {
+        out.push(`- ${row[0] ?? ''}`)
+        for (let k = 1; k < header.length; k++) if (row[k]) out.push(`  - *${header[k]}*: ${row[k]}`)
+      }
+    }
+    i = end - 1
+  }
+
+  return out.join('\n')
+}
+
+export const ago =(at: number, now: number): string => {
   const seconds = Math.max(0, Math.round((now - at) / 1000))
   if (seconds < 45) return 'now'
   const minutes = Math.round(seconds / 60)
