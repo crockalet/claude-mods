@@ -3,28 +3,14 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Ask, Crumbs, Note, Repo, View, Where } from '../types'
 import { contextMarkdown, repoState } from './markdown'
+import { normalize } from './state'
 import type { Saved } from './markdown'
 import { ago, asks, basename, cdTarget, clip, day, head, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
 const SAVE_NOTE = 'mcp__breadcrumbs__save_note'
-const EMPTY: Crumbs = {
-  tasks: [],
-  prompts: [],
-  activity: null,
-  lastSaid: null,
-  notes: [],
-  decided: [],
-  tried: [],
-  needsYou: [],
-  done: [],
-  edited: [],
-  touched: [],
-  repos: [],
-  asking: null,
-}
 
-const crumbs = atom({ plugin: 'breadcrumbs', key: 'crumbs' } as const, EMPTY)
+const crumbs = atom({ plugin: 'breadcrumbs', key: 'crumbs' } as const, normalize({}))
 const where = atom({ plugin: 'breadcrumbs', key: 'where' } as const, null)
 const view = atom({ plugin: 'breadcrumbs', key: 'view' } as const, {
   openNote: null,
@@ -42,6 +28,11 @@ const NOTE_GUIDANCE = [
 ].join(' ')
 
 type $ = EngineInterface
+
+// Session state outlives reloads, so it can predate fields added since; every access goes through normalize.
+const readCrumbs = async ($: $): Promise<Crumbs> => normalize(await read($, crumbs))
+
+const mutate = ($: $, fn: (c: Crumbs) => Crumbs) => update($, crumbs, c => fn(normalize(c)))
 
 const notesRoot = async ($: $): Promise<string> =>
   `${(await $.env.get('HOME')) ?? '~'}/.agents/notes`
@@ -69,7 +60,7 @@ const locate = async ($: $): Promise<Where> => {
 }
 
 const refreshRepos = async ($: $) => {
-  const c = await read($, crumbs)
+  const c = await readCrumbs($)
   const place = await read($, where)
   const places = new Set([...c.touched, ...c.edited.map(f => f.slice(0, f.lastIndexOf('/')))])
   if (place) places.add(place.worktree)
@@ -83,7 +74,7 @@ const refreshRepos = async ($: $) => {
     const status = await git($, root, 'status', '--porcelain=v1', '-b')
     if (status !== null) repos.push({ root, ...parseStatus(status) })
   }
-  await update($, crumbs, old => ({ ...old, repos }))
+  await mutate($, old => ({ ...old, repos }))
 }
 
 const worktreeDir = (root: string, where: Where) =>
@@ -225,7 +216,7 @@ const ensureDir = async ($: $, title: string): Promise<string> => {
 }
 
 const save = async ($: $, status: string) => {
-  const state = await read($, crumbs)
+  const state = await readCrumbs($)
   const place = await read($, where)
   if (!place || (state.tasks.length === 0 && state.notes.length === 0)) return
   const target = await ensureDir($, state.tasks[0]?.title ?? 'session')
@@ -244,7 +235,7 @@ const clean = async ($: $) => {
 type Turn = { answer: string; hasSavedNote: boolean; tools: string[] }
 
 const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
-  const state = await read($, crumbs)
+  const state = await readCrumbs($)
   const prompt = state.prompts.at(-1)?.text ?? ''
   const request = [
     'You keep a running log of a coding session for a developer who switches between many sessions.',
@@ -290,7 +281,7 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools }: Turn) => {
         .slice(0, 3)
         .map(a => ({ text: clip(a.text, 100), isOk: a.isOk !== false }))
     : []
-  await update($, crumbs, c => {
+  await mutate($, c => {
     let tasks = c.tasks
     if (task && (tasks.length === 0 || out.isNewTask === true)) {
       tasks = [{ title: task, at: now }, ...tasks].slice(0, 6)
@@ -329,14 +320,14 @@ const runPending = async ($: $) => {
 }
 
 const saveNote = async ($: $, title: string, markdown: string): Promise<Note> => {
-  const state = await read($, crumbs)
+  const state = await readCrumbs($)
   const target = await ensureDir($, state.tasks[0]?.title ?? title)
   const now = await $.clock.now()
   const number = String(state.notes.length + 1).padStart(2, '0')
   const file = `${target}/${number}-${slug(title)}.md`
   await $.fs.write(file, `---\ntitle: ${title.replace(/\n/g, ' ')}\ntask: ${state.tasks[0]?.title ?? ''}\nsession: ${sessionId}\n---\n\n# ${title}\n\n${markdown.trim()}\n`)
   const note: Note = { id: `${now}-${number}`, title: clip(title, 80), file, at: now, isPinned: false }
-  await update($, crumbs, c => ({ ...c, notes: [...c.notes, note] }))
+  await mutate($, c => ({ ...c, notes: [...c.notes, note] }))
   await save($, 'working')
 
   return note
@@ -347,7 +338,7 @@ const pin = async ($: $, note: Note) => {
   if (!place) return
   const text = await $.fs.read(note.file)
   await $.fs.write(`${await notesRoot($)}/${place.repo}/_pinned/${basename(note.file)}`, text)
-  await update($, crumbs, c => ({ ...c, notes: c.notes.map(n => (n.id === note.id ? { ...n, isPinned: true } : n)) }))
+  await mutate($, c => ({ ...c, notes: c.notes.map(n => (n.id === note.id ? { ...n, isPinned: true } : n)) }))
   await save($, 'working')
   $.ui.toast(`Pinned "${note.title}"`)
 }
@@ -355,16 +346,16 @@ const pin = async ($: $, note: Note) => {
 const track = async ($: $, e: Record<string, unknown>) => {
   const file = typeof e.file_path === 'string' ? e.file_path : typeof e.notebook_path === 'string' ? e.notebook_path : ''
   if ((e.tool === 'Edit' || e.tool === 'Write' || e.tool === 'NotebookEdit') && file) {
-    await update($, crumbs, c => ({ ...c, edited: [...c.edited.filter(f => f !== file), file].slice(-50) }))
+    await mutate($, c => ({ ...c, edited: [...c.edited.filter(f => f !== file), file].slice(-50) }))
   }
   if (e.tool === 'Bash' && typeof e.command === 'string') {
     const dir = cdTarget(e.command, (await $.env.get('HOME')) ?? '')
-    if (dir) await update($, crumbs, c => ({ ...c, touched: [...c.touched.filter(d => d !== dir), dir].slice(-20) }))
+    if (dir) await mutate($, c => ({ ...c, touched: [...c.touched.filter(d => d !== dir), dir].slice(-20) }))
   }
 }
 
 const dropAsk = ($: $, question: string) =>
-  update($, crumbs, c => ({ ...c, needsYou: c.needsYou.filter(a => a.question !== question) }))
+  mutate($, c => ({ ...c, needsYou: c.needsYou.filter(a => a.question !== question) }))
 
 const answerAsk = async ($: $, ask: Ask, option: string) => {
   await dropAsk($, ask.question)
@@ -391,14 +382,12 @@ export const register: Register = (on, options) => {
 
     const known = await $.store.get(`dir:${sessionId}`)
     dir = typeof known === 'string' ? known : null
-    // Session state outlives reloads, so state written by an older version lacks newer fields.
-    await update($, crumbs, old => ({ ...EMPTY, ...old, needsYou: asks(old.needsYou) }))
-    const current = await read($, crumbs)
+    const current = await readCrumbs($)
     if (dir && current.tasks.length === 0 && current.notes.length === 0) {
       const saved = await readSaved($, dir)
       if (saved) {
         const { session: _s, worktree: _w, updatedAt: _u, ...restored } = saved
-        await update($, crumbs, () => ({ ...EMPTY, ...restored, needsYou: asks(restored.needsYou), activity: null, asking: null }))
+        await mutate($, () => ({ ...normalize(restored), activity: null, asking: null }))
       }
     }
 
@@ -422,6 +411,7 @@ export const register: Register = (on, options) => {
 
     if (e.isInteractive && options.panel !== 'command') void $.ui.open({ id: PANE, title: 'breadcrumbs' })
     $.clock.every(30_000, () => $.ui.invalidate('ui.render'))
+    $.clock.after(0, () => refreshRepos($))
     // A hot reload drops the old module's timers, including a pass it just queued; poll so this copy picks it up.
     $.clock.every(15_000, () => runPending($))
 
@@ -451,7 +441,7 @@ export const register: Register = (on, options) => {
     if (isPerson && e.text.trim() && !e.text.trimStart().startsWith('/')) {
       const now = await $.clock.now()
       // A new prompt usually answers what was pending; the next side pass re-asks anything still open.
-      await update($, crumbs, c => ({ ...c, needsYou: [], prompts: [...c.prompts, { text: e.text.trim(), at: now }].slice(-5) }))
+      await mutate($, c => ({ ...c, needsYou: [], prompts: [...c.prompts, { text: e.text.trim(), at: now }].slice(-5) }))
       if (e.turnId === undefined) {
         turnTools = []
         hasSavedNote = false
@@ -476,17 +466,17 @@ export const register: Register = (on, options) => {
     const label = toolLabel(String(e.tool), e as Record<string, unknown>)
     turnTools.push(label)
     if (e.tool !== 'AskUserQuestion') {
-      await update($, crumbs, c => ({ ...c, activity: label }))
+      await mutate($, c => ({ ...c, activity: label }))
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) await track($, e as Record<string, unknown>)
       return ran
     }
     const question = e.questions[0]?.question ?? 'A question for you'
-    await update($, crumbs, c => ({ ...c, activity: 'Waiting on you', asking: clip(question, 120) }))
+    await mutate($, c => ({ ...c, activity: 'Waiting on you', asking: clip(question, 120) }))
     try {
       return await next(e)
     } finally {
-      await update($, crumbs, c => ({ ...c, activity: null, asking: null }))
+      await mutate($, c => ({ ...c, activity: null, asking: null }))
     }
   })
 
@@ -497,7 +487,7 @@ export const register: Register = (on, options) => {
     await refreshRepos($)
     const now = await $.clock.now()
     const answer = e.answer.trim()
-    await update($, crumbs, c => ({
+    await mutate($, c => ({
       ...c,
       activity: null,
       lastSaid: answer ? { text: head(answer, 600), at: now } : c.lastSaid,
@@ -542,7 +532,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
-    const c = await read($, crumbs)
+    const c = await readCrumbs($)
     const place: Where | null = await read($, where)
     const v = await read($, view)
     const now = await $.clock.now()

@@ -19,11 +19,11 @@ const PANE = {
 
 const submitted: string[] = []
 
-const world = (on: On, reply = '{}') => {
+const world = (on: On, reply = '{}', hasStore = false) => {
   const files = new Map<string, string>()
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/dev' })
-  mock.store(on)
+  if (!hasStore) mock.store(on)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__breadcrumbs__${e.name}` } }))
@@ -126,5 +126,18 @@ describe('breadcrumbs', () => {
     await ui.press({ key: 'ask-0-opt-0' })
     expect(submitted.at(-1)).toBe('Re: "Approve the PR description?" — Yes')
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
+  })
+
+  test('state written by an older version still draws', async ($, on) => {
+    mock.store(on, { 'dir:abc123def456': '/old' })
+    const { files } = world(on, '{}', true)
+    const old = { tasks: [{ title: 'Old task', at: NOW }], prompts: [], activity: null, lastSaid: null, notes: [], decided: [], tried: [], needsYou: ['Delete the dev copy?'], session: 'abc123def456', worktree: '/code/feat-sync', updatedAt: NOW }
+    files.set('/old/state.json', JSON.stringify(old))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: 'Old task' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Delete the dev copy?' })).toBeDefined()
+    expect(await ui.find({ key: 'ask-0-reply' })).toBeDefined()
   })
 })
