@@ -7,7 +7,7 @@ When Claude needs a secret it calls `request_secret` with a name like `GITHUB_TO
 - The value is written to a 0600 file in a private temp folder and exported only into Bash commands that mention `$NAME` or `${NAME}`. The command Claude sees and the transcript never contain the value.
 - Any tool result (subagents' included) or prompt that contains a stored value has it replaced with `«secret:NAME»`.
 - Tool calls that name the secrets folder are refused.
-- When the permission check would ask about a Bash command that uses a secret, you decide in the same band instead of the dialog or auto mode's classifier. It shows who wants the secret (Claude or a subagent) and the command, with **Allow once**, **Allow $NAME this session** and **Deny**. An approval nobody answers is denied after 10 minutes. Commands your rules already allow or deny are left alone, and so is an ask your organization caps.
+- When the permission check would ask about a Bash command that uses a secret, you decide in the same band instead of the dialog or auto mode's classifier. It shows who wants the secret (Claude or a subagent) and the command, with **Allow once** (for a subagent, **Allow for this subagent**: the rest of its run, until it finishes), **Allow $NAME this session** and **Deny**. An approval nobody answers is denied after 10 minutes. Commands your rules already allow or deny are left alone, and so is an ask your organization caps.
 - Secrets last for the session. The folder is deleted when the session ends.
 
 Mods need Claude Code 2.1.287 or later.

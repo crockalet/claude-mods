@@ -52,6 +52,7 @@ const store = async ($: $, name: string, value: string) => {
   values.set(name, value)
   await update($, namesRef, list => (list.includes(name) ? list : [...list, name]))
   await update($, allowedRef, list => list.filter(n => n !== name))
+  for (const run of runAllowed.values()) run.delete(name)
 }
 
 const forget = async ($: $, names: string[]) => {
@@ -60,6 +61,7 @@ const forget = async ($: $, names: string[]) => {
   for (const n of names) values.delete(n)
   await update($, namesRef, list => list.filter(n => !names.includes(n)))
   await update($, allowedRef, list => list.filter(n => !names.includes(n)))
+  for (const run of runAllowed.values()) for (const n of names) run.delete(n)
 }
 
 const secrets = async ($: $): Promise<Secret[]> => {
@@ -136,11 +138,25 @@ const submit = async ($: $, ask: SecretAsk, typed: string) => {
 }
 
 const approvalAnswers = new Map<string, Approval>()
+// Allow once for a subagent covers the rest of its run, until its turn.complete.
+const runAllowed = new Map<string, Set<string>>()
+
+const coveredByRun = (agentId: string | null, names: string[]) =>
+  agentId !== null && names.every(n => runAllowed.get(agentId)?.has(n))
 
 const answerApproval = async ($: $, approval: SecretApproval, answer: Approval) => {
   approvalAnswers.set(approval.id, answer)
   if (answer === 'session') await update($, allowedRef, list => [...new Set([...list, ...approval.names])])
-  await update($, approvalsRef, list => list.filter(a => a.id !== approval.id))
+  if (answer === 'once' && approval.agentId) {
+    runAllowed.set(approval.agentId, new Set([...(runAllowed.get(approval.agentId) ?? []), ...approval.names]))
+  }
+  const allowed = await read($, allowedRef)
+  // Parallel calls from the same run queue several approvals; one answer settles those it now covers.
+  const settled = (await read($, approvalsRef)).filter(
+    a => a.id === approval.id || (answer !== 'deny' && (a.names.every(n => allowed.includes(n)) || coveredByRun(a.agentId, a.names))),
+  )
+  for (const a of settled) if (a.id !== approval.id) approvalAnswers.set(a.id, answer === 'session' ? 'session' : 'once')
+  await update($, approvalsRef, list => list.filter(a => !settled.some(s => s.id === a.id)))
 }
 
 const vars = (names: string[]) => names.map(n => `$${n}`).join(', ')
@@ -223,6 +239,7 @@ export const register: Register = on => {
     await update($, dirRef, () => null)
     await update($, namesRef, () => [])
     await update($, allowedRef, () => [])
+    runAllowed.clear()
     await update($, approvalsRef, () => [])
 
     return next(e)
@@ -298,6 +315,12 @@ export const register: Register = on => {
     return redact(await next(prefix ? { ...e, command: prefix + e.command } : e), redactable(list))
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'secrets: its guard failed, so the call was refused.' }))
 
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId !== undefined) runAllowed.delete(e.agentId)
+
+    return next(e)
+  })
+
   on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
     const verdict = await next(e)
     // An organization's ceiling below allow is not ours to lift.
@@ -307,6 +330,7 @@ export const register: Register = on => {
     if (names.length === 0) return verdict
     const allowed = await read($, allowedRef)
     if (names.every(n => allowed.includes(n))) return { decision: 'allow', reason: `The person allowed ${vars(names)} for this session.` }
+    if (coveredByRun(e.agentId ?? null, names)) return { decision: 'allow', reason: `The person allowed ${vars(names)} for this subagent's run.` }
 
     return approve($, names, command, e.agentId ?? null, next.signal)
   }).catch(() => ({ decision: 'deny', reason: 'secrets: the approval check failed, so the call was refused.' }))
@@ -359,7 +383,7 @@ export const register: Register = on => {
             {hint}A session allowance lets any command using it run unchecked.{more}
           </Text>
           <Box columnGap={1} flexWrap="wrap">
-            <Button key={`approve-${approval.id}-once`} hotkey="1" variant="primary" label="Allow once" onPress={() => answerApproval($, approval, 'once')} />
+            <Button key={`approve-${approval.id}-once`} hotkey="1" variant="primary" label={approval.agentId ? 'Allow for this subagent' : 'Allow once'} onPress={() => answerApproval($, approval, 'once')} />
             <Button key={`approve-${approval.id}-session`} hotkey="2" label={`Allow ${vars(approval.names)} this session`} onPress={() => answerApproval($, approval, 'session')} />
             <Button key={`approve-${approval.id}-deny`} hotkey="3" label="Deny" onPress={() => answerApproval($, approval, 'deny')} />
           </Box>

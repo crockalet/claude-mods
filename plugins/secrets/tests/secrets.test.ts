@@ -240,6 +240,26 @@ describe('secrets', () => {
     expect((await answer($, CURL, 'deny')).verdict.decision).toBe('deny')
   })
 
+  test('allow for a subagent covers its run, parallel asks included, until it completes', async ($, on) => {
+    world(on)
+    verdictOf(on)
+    on('turn.complete', () => ({ text: '' }))
+    await start($)
+    await provide($, 'GITHUB_TOKEN', VALUE)
+
+    expect((await answer($, CURL, 'once', 'agent-1')).verdict.decision).toBe('allow')
+    // No band this time: a pending check would hang here.
+    expect((await check($, CURL, 'agent-1')).decision).toBe('allow')
+    expect((await answer($, CURL, 'deny', 'agent-2')).verdict.decision).toBe('deny')
+
+    const parallel = check($, CURL, 'agent-3')
+    expect((await answer($, CURL, 'once', 'agent-3')).verdict.decision).toBe('allow')
+    expect((await parallel).decision).toBe('allow')
+
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer', agentId: 'agent-1' } as never)
+    expect((await answer($, CURL, 'deny', 'agent-1')).verdict.decision).toBe('deny')
+  })
+
   test('allow and deny verdicts, and commands without a secret, pass through', async ($, on) => {
     world(on)
     const verdict = verdictOf(on)
