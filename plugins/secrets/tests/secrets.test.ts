@@ -18,7 +18,7 @@ const world = (on: On, stdout = '') => {
   const files = new Map<string, string>()
   const commands: string[] = []
   const prompts: string[] = []
-  mock.clock(on, { now: Date.UTC(2026, 9, 6, 9, 0) })
+  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 6, 9, 0) })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__secrets__${e.name}` } }))
@@ -53,7 +53,7 @@ const world = (on: On, stdout = '') => {
     return { text: e.text, context: e.context }
   })
 
-  return { files, commands, prompts }
+  return { files, commands, prompts, clock }
 }
 
 const start = ($: Engine) => $.session.start({ cwd: '/code/app', surface: null, isInteractive: true })
@@ -75,6 +75,33 @@ const provide = async ($: Engine, name: string, value: string | null) => {
   await ui.unmount()
 
   return done
+}
+
+const CURL = 'curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user'
+
+// The engine's verdict beneath the plugin, set per test.
+const verdictOf = (on: On) => {
+  const state = { decision: 'ask' as 'allow' | 'ask' | 'deny' }
+  on('tool.check', () => ({ decision: state.decision }))
+  return state
+}
+
+const check = ($: Engine, command: string, agentId?: string) =>
+  $.tool.check({ tool: 'Bash', input: { command }, tool_use_id: 'tu', ...(agentId ? { agentId } : {}) } as never)
+
+// Raises a check and answers its approval in the band with one of its buttons.
+const answer = async ($: Engine, command: string, button: 'once' | 'session' | 'deny', agentId?: string) => {
+  const ui = await $.ui.mount({ plugin: 'secrets', surface: 'terminal', ...BAND })
+  const checking = check($, command, agentId)
+  let found
+  for (let i = 0; i < 50 && !found; i++) found = await ui.find({ type: 'Button', text: 'Deny' })
+  const head = await ui.find({ type: 'Text', text: /wants to use/ })
+  expect(await ui.find({ type: 'Text', text: /curl -H/ })).toBeDefined()
+  await ui.press({ key: String(found?.key).replace(/-deny$/, `-${button}`) })
+  const verdict = await checking
+  await ui.unmount()
+
+  return { verdict, head: String(head?.text ?? '') }
 }
 
 describe('secrets', () => {
@@ -187,6 +214,58 @@ describe('secrets', () => {
     expect(prompts[0]).toContain('List my repos\n\nWhen a task needs a secret')
     expect(prompts[0]).toContain('The person provided GITHUB_TOKEN through the secrets mod this session; use $GITHUB_TOKEN in Bash.')
     expect(prompts[0]).not.toContain(VALUE)
+  })
+
+  test('an ask on a command using a secret goes to the band; each button decides', async ($, on) => {
+    world(on)
+    verdictOf(on)
+    await start($)
+    await provide($, 'GITHUB_TOKEN', VALUE)
+
+    const once = await answer($, CURL, 'once', 'agent-1')
+    expect(once.verdict.decision).toBe('allow')
+    expect(once.head).toContain('A subagent wants to use $GITHUB_TOKEN')
+    const denied = await answer($, `export GITHUB_TOKEN="$(cat '${DIR}/GITHUB_TOKEN')"; ${CURL}`, 'deny')
+    expect(denied.verdict).toMatchObject({ decision: 'deny', reason: 'The person denied using $GITHUB_TOKEN for this command.' })
+    expect(denied.head).toContain('Claude wants to use')
+
+    const session = await answer($, CURL, 'session')
+    expect(session.verdict.decision).toBe('allow')
+    expect((await slash($, '')).text).toContain('Allowed without asking this session: GITHUB_TOKEN.')
+    // No band this time: a pending check would hang here.
+    expect((await check($, CURL, 'agent-2')).decision).toBe('allow')
+
+    await slash($, 'forget GITHUB_TOKEN')
+    await provide($, 'GITHUB_TOKEN', VALUE)
+    expect((await answer($, CURL, 'deny')).verdict.decision).toBe('deny')
+  })
+
+  test('allow and deny verdicts, and commands without a secret, pass through', async ($, on) => {
+    world(on)
+    const verdict = verdictOf(on)
+    await start($)
+    await provide($, 'GITHUB_TOKEN', VALUE)
+    expect((await check($, 'ls -la')).decision).toBe('ask')
+    verdict.decision = 'deny'
+    expect((await check($, CURL)).decision).toBe('deny')
+    verdict.decision = 'allow'
+    expect((await check($, CURL)).decision).toBe('allow')
+  })
+
+  test('an approval nobody answers is denied after 10 minutes', async ($, on) => {
+    const { clock } = world(on)
+    verdictOf(on)
+    await start($)
+    await provide($, 'GITHUB_TOKEN', VALUE)
+    const ui = await $.ui.mount({ plugin: 'secrets', surface: 'terminal', ...BAND })
+    const checking = check($, CURL)
+    let found
+    for (let i = 0; i < 50 && !found; i++) found = await ui.find({ type: 'Button', text: 'Deny' })
+    await clock.advance(10 * 60_000 + 1)
+    const verdict = await checking
+    expect(verdict.decision).toBe('deny')
+    expect(await ui.find({ type: 'Button', text: 'Deny' })).toBeUndefined()
+    await ui.unmount()
   })
 
   test('cancel tells Claude the person declined and stores nothing', async ($, on) => {

@@ -1,20 +1,24 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import type { SecretAsk } from '../types'
+import type { SecretApproval, SecretAsk } from '../types'
 
 type $ = EngineInterface
 type Secret = [name: string, value: string]
 type Answer = 'set' | 'declined'
+type Approval = 'once' | 'session' | 'deny'
 
 const TOOL = 'mcp__secrets__request_secret'
 const NAME = /^[A-Z_][A-Z0-9_]*$/
 const WAIT_LIMIT_MS = 30 * 60_000
+const APPROVAL_LIMIT_MS = 10 * 60_000
 const MIN_REDACT = 4
 
 const dirRef = atom({ plugin: 'secrets', key: 'dir' } as const, null)
 const namesRef = atom({ plugin: 'secrets', key: 'names' } as const, [])
 const asksRef = atom({ plugin: 'secrets', key: 'asks' } as const, [])
+const approvalsRef = atom({ plugin: 'secrets', key: 'approvals' } as const, [])
+const allowedRef = atom({ plugin: 'secrets', key: 'allowed' } as const, [])
 
 const GUIDANCE = [
   `When a task needs a secret (an API token, a password, a key), call ${TOOL} with an env-style name and a one-line reason`,
@@ -47,6 +51,7 @@ const store = async ($: $, name: string, value: string) => {
   if (wrote.exitCode !== 0) throw new Error(`could not save ${name}: ${wrote.stderr.trim()}`)
   values.set(name, value)
   await update($, namesRef, list => (list.includes(name) ? list : [...list, name]))
+  await update($, allowedRef, list => list.filter(n => n !== name))
 }
 
 const forget = async ($: $, names: string[]) => {
@@ -54,6 +59,7 @@ const forget = async ($: $, names: string[]) => {
   if (dir && names.length > 0) await $.process.run(['rm', '-f', ...names.map(n => `${dir}/${n}`)])
   for (const n of names) values.delete(n)
   await update($, namesRef, list => list.filter(n => !names.includes(n)))
+  await update($, allowedRef, list => list.filter(n => !names.includes(n)))
 }
 
 const secrets = async ($: $): Promise<Secret[]> => {
@@ -106,6 +112,11 @@ const redact = (r: ToolCallResult, list: Secret[]): ToolCallResult => {
 
 const mentions = (command: string, name: string) => new RegExp(`\\$\\{?${name}(?![A-Za-z0-9_])`).test(command)
 
+const INJECTED = /^(export [A-Z_][A-Z0-9_]*="\$\(cat '[^']*'\)"; )+/
+
+// tool.check may see the command before or after tool.call added the export prefix.
+const uses = (command: string, name: string) => mentions(command, name) || command.includes(`export ${name}="$(cat '`)
+
 // A state read inside the waiting hook does not see the press's write, so the answer travels through the module.
 const answers = new Map<string, Answer>()
 
@@ -122,6 +133,38 @@ const submit = async ($: $, ask: SecretAsk, typed: string) => {
   }
   await store($, ask.name, value)
   await decide($, ask.id, 'set')
+}
+
+const approvalAnswers = new Map<string, Approval>()
+
+const answerApproval = async ($: $, approval: SecretApproval, answer: Approval) => {
+  approvalAnswers.set(approval.id, answer)
+  if (answer === 'session') await update($, allowedRef, list => [...new Set([...list, ...approval.names])])
+  await update($, approvalsRef, list => list.filter(a => a.id !== approval.id))
+}
+
+const vars = (names: string[]) => names.map(n => `$${n}`).join(', ')
+
+// The person, not the mode's decider, settles an ask on a command that uses a secret.
+const approve = async ($: $, names: string[], command: string, agentId: string | null, signal: AbortSignal) => {
+  const now = await $.clock.now()
+  const id = `${now}-${Math.random().toString(36).slice(2, 7)}`
+  const shown = command.replace(INJECTED, '')
+  await update($, approvalsRef, list => [...list, { id, names, command: shown.length > 200 ? `${shown.slice(0, 199)}…` : shown, agentId, at: now }])
+  $.ui.toast(`${agentId ? 'A subagent' : 'Claude'} wants to use ${vars(names)}: answer above the prompt`)
+
+  let answer: Approval | undefined
+  while (answer === undefined && !signal.aborted && (await $.clock.now()) - now < APPROVAL_LIMIT_MS) {
+    await $.process.run(['sleep', '1'])
+    answer = approvalAnswers.get(id)
+  }
+  approvalAnswers.delete(id)
+  await update($, approvalsRef, list => list.filter(a => a.id !== id))
+
+  if (answer === 'once' || answer === 'session') return { decision: 'allow' as const, reason: `The person allowed ${vars(names)} for this command.` }
+  if (answer === 'deny') return { decision: 'deny' as const, reason: `The person denied using ${vars(names)} for this command.` }
+
+  return { decision: 'deny' as const, reason: `No answer from the person about using ${vars(names)}${signal.aborted ? '' : ' within 10 minutes'}.` }
 }
 
 const requestSecret = async ($: $, e: Record<string, unknown>, signal: AbortSignal) => {
@@ -179,6 +222,8 @@ export const register: Register = on => {
     values.clear()
     await update($, dirRef, () => null)
     await update($, namesRef, () => [])
+    await update($, allowedRef, () => [])
+    await update($, approvalsRef, () => [])
 
     return next(e)
   })
@@ -189,7 +234,6 @@ export const register: Register = on => {
     return { sections: [...composed.sections, { id: 'secrets:guidance', text: GUIDANCE, scope: 'session' }] }
   })
 
-  // The earliest point: a queued prompt's raw text reaches the transcript file before prompt.submit can scrub it.
   // prompt.compose carries no agentId, so nothing shows a subagent's system prompt gets the section; its task prompt does.
   on('agent.spawn', async ($, e, next) => {
     const names = await read($, namesRef)
@@ -198,6 +242,7 @@ export const register: Register = on => {
     return next({ ...e, prompt: `${e.prompt}\n\n${GUIDANCE}${provided}` })
   })
 
+  // The earliest point: a queued prompt's raw text reaches the transcript file before prompt.submit can scrub it.
   on('prompt.edit', async ($, e, next) => {
     const list = redactable(await secrets($))
     if (list.length === 0) return next(e)
@@ -253,6 +298,19 @@ export const register: Register = on => {
     return redact(await next(prefix ? { ...e, command: prefix + e.command } : e), redactable(list))
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'secrets: its guard failed, so the call was refused.' }))
 
+  on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
+    const verdict = await next(e)
+    // An organization's ceiling below allow is not ours to lift.
+    if (verdict.decision !== 'ask' || (e.ceiling !== undefined && e.ceiling !== 'allow')) return verdict
+    const command = str((e.input as { command?: unknown } | null)?.command)
+    const names = (await read($, namesRef)).filter(n => uses(command, n))
+    if (names.length === 0) return verdict
+    const allowed = await read($, allowedRef)
+    if (names.every(n => allowed.includes(n))) return { decision: 'allow', reason: `The person allowed ${vars(names)} for this session.` }
+
+    return approve($, names, command, e.agentId ?? null, next.signal)
+  }).catch(() => ({ decision: 'deny', reason: 'secrets: the approval check failed, so the call was refused.' }))
+
   on('command.run', { command: 'secrets' }, async ($, e) => {
     const [verb = '', arg = ''] = e.args.trim().split(/\s+/)
     const names = await read($, namesRef)
@@ -267,15 +325,48 @@ export const register: Register = on => {
     }
     if (names.length === 0) return { text: 'No secrets set this session. Claude asks for one with request_secret.' }
 
-    return { text: `Secrets set this session: ${names.join(', ')}. Values are never shown.` }
+    const allowed = (await read($, allowedRef)).filter(n => names.includes(n))
+    const always = allowed.length > 0 ? ` Allowed without asking this session: ${allowed.join(', ')}.` : ''
+
+    return { text: `Secrets set this session: ${names.join(', ')}. Values are never shown.${always}` }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const waiting = await read($, asksRef)
+    const approvals = await read($, approvalsRef)
     const ask = waiting[0]
+    const approval = approvals[0]
     const elements = $.ui.resolve(e)
-    if (!ask || e.props.hasSurvey || !('Input' in elements)) return next(e)
+    if ((!ask && !approval) || e.props.hasSurvey || !('Input' in elements)) return next(e)
     const { Box, Text, Button, Input } = elements
+    const queued = waiting.length + approvals.length - 1
+    const more = queued > 0 ? ` ${queued} more waiting.` : ''
+
+    if (!ask && approval) {
+      const who = approval.agentId ? 'A subagent' : 'Claude'
+      const hint = e.surface === 'terminal' ? 'ctrl+x tab to choose. ' : ''
+      return (
+        <Box flexDirection="column">
+          <Text>
+            <Text color="warning">● </Text>
+            {who} wants to use <Text bold>{vars(approval.names)}</Text>
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            {'  $ '}
+            {approval.command}
+          </Text>
+          <Text dimColor>
+            {hint}A session allowance lets any command using it run unchecked.{more}
+          </Text>
+          <Box columnGap={1} flexWrap="wrap">
+            <Button key={`approve-${approval.id}-once`} hotkey="1" variant="primary" label="Allow once" onPress={() => answerApproval($, approval, 'once')} />
+            <Button key={`approve-${approval.id}-session`} hotkey="2" label={`Allow ${vars(approval.names)} this session`} onPress={() => answerApproval($, approval, 'session')} />
+            <Button key={`approve-${approval.id}-deny`} hotkey="3" label="Deny" onPress={() => answerApproval($, approval, 'deny')} />
+          </Box>
+        </Box>
+      )
+    }
+    if (!ask) return next(e)
     const isSet = (await read($, namesRef)).includes(ask.name)
     const hint = e.surface === 'terminal' ? 'ctrl+x tab to type here, Enter to save' : 'Enter to save'
 
@@ -287,7 +378,7 @@ export const register: Register = on => {
         </Text>
         <Text dimColor>
           {hint}. Shown here as plain text; Claude never sees it.{isSet ? ' Replaces the current value.' : ''}
-          {waiting.length > 1 ? ` ${waiting.length - 1} more waiting.` : ''}
+          {more}
         </Text>
         <Input key={`secret-${ask.id}`} label={`${ask.name}=`} placeholder="paste the value…" submitLabel="save" autoFocus onSubmit={v => submit($, ask, v)} />
         <Box>
