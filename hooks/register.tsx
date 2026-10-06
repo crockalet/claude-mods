@@ -25,7 +25,7 @@ const VIEW: View = {
 }
 const view = atom({ plugin: 'breadcrumbs', key: 'view' } as const, VIEW)
 const pending = atom({ plugin: 'breadcrumbs', key: 'pending' } as const, null)
-const testRun = atom({ plugin: 'breadcrumbs', key: 'tests' } as const, { tests: [], waits: [], unreported: [] })
+const testRun = atom({ plugin: 'breadcrumbs', key: 'tests' } as const, { brief: '', tests: [], waits: [], unreported: [] })
 const testsView = atom({ plugin: 'breadcrumbs', key: 'testsView' } as const, { expanded: null, typed: {} })
 
 const NOTE_GUIDANCE = [
@@ -393,6 +393,7 @@ const restoreFrom = async ($: $, from: string) => {
   if (savedTests && (await read($, testRun)).tests.length === 0) {
     // A tester or a waiting step doesn't outlive its session.
     await update($, testRun, () => ({
+      brief: savedTests.brief ?? '',
       tests: savedTests.tests.map(t => ({ ...t, status: t.status === 'running' ? 'todo' : t.status, agentId: null })),
       waits: [],
       unreported: savedTests.unreported,
@@ -528,7 +529,11 @@ const draftAsk = async ($: $, ask: Ask) => {
   $.ui.toast('Finish your answer in the prompt box')
 }
 
-const readRun = ($: $): Promise<TestRun> => read($, testRun)
+// A run saved before the brief existed has none.
+const readRun = async ($: $): Promise<TestRun> => {
+  const r = await read($, testRun)
+  return { ...r, brief: r.brief ?? '' }
+}
 
 // Kept in its own file and written only when a test changes, so a turn's save never rewrites it from an empty live list.
 const mutateTests = async ($: $, fn: (r: TestRun) => TestRun) => {
@@ -610,8 +615,10 @@ const markTest = async ($: $, t: ManualTest, status: 'passed' | 'failed', typed:
 }
 
 const startTester = async ($: $, t: ManualTest) => {
+  const { brief } = await readRun($)
   const prompt = [
     `Test ${t.id}: ${t.title}`,
+    brief ? `Brief from the planner:\n${brief}` : '',
     t.steps.length > 0 ? `Steps:\n${t.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : '',
     t.expect ? `Expected: ${t.expect}` : '',
     t.watch ? `Follow along with: ${t.watch}` : '',
@@ -657,8 +664,10 @@ const planTests = async ($: $, e: Record<string, unknown>) => {
     }))
   if (incoming.length === 0) return { deny: 'test_plan needs at least one test with a title.' }
   const ids = new Set(incoming.map(t => t.id))
+  const brief = str(e.brief)
   await mutateTests($, old => ({
     ...old,
+    brief: brief || (isAppending ? old.brief ?? '' : ''),
     tests: [...kept.filter(t => !ids.has(t.id)), ...incoming],
     waits: isAppending ? old.waits : [],
     unreported: isAppending ? old.unreported : [],
@@ -671,12 +680,15 @@ const planTests = async ($: $, e: Record<string, unknown>) => {
 }
 
 const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string }) => {
+  const brief = str(e.brief)
+  if (brief) await mutateTests($, r => ({ ...r, brief }))
   const t = testOf(await readRun($), e)
-  if (!t) return { deny: 'No such test: pass the id from test_plan.' }
+  if (!t) return brief && e.id === undefined ? { result: 'Updated the brief.' } : { deny: 'No such test: pass the id from test_plan.' }
   const status = STATUSES.find(s => s === e.status)
   const note = str(e.note)
   const steps = listOf(e.steps)
-  await patchTest($, t.id, old => ({ ...old, status: status ?? old.status, steps: steps.length > 0 ? steps : old.steps }))
+  const expect = str(e.expect)
+  await patchTest($, t.id, old => ({ ...old, status: status ?? old.status, steps: steps.length > 0 ? steps : old.steps, expect: expect || old.expect }))
   if (note || status) await logTest($, t.id, e.agentId === undefined ? 'claude' : 'tester', `${status && status !== t.status ? `${ICON[status]} ` : ''}${note || status}`)
 
   return { result: `Updated test ${t.id}.` }
@@ -684,7 +696,8 @@ const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string 
 
 const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }, signal: AbortSignal) => {
   const instruction = str(e.instruction)
-  if (!instruction) return { deny: 'await_user needs an instruction.' }
+  const steps = listOf(e.steps).map(s => clip(s, 120))
+  if (!instruction && steps.length === 0) return { deny: 'await_user needs an instruction or steps.' }
   const t = testOf(await readRun($), e)
   const now = await $.clock.now()
   const wait: Wait = {
@@ -692,6 +705,8 @@ const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }
     testId: t?.id ?? null,
     step: typeof e.step === 'number' ? e.step : null,
     instruction: clip(instruction, 200),
+    steps,
+    options: listOf(e.options).slice(0, 4).map(o => clip(o, 30)),
     at: now,
     answer: null,
   }
@@ -820,6 +835,10 @@ export const register: Register = (on, options) => {
       inputSchema: {
         type: 'object',
         properties: {
+          brief: {
+            type: 'string',
+            description: 'Read by every tester before its test: the change, the environment, how to observe results, what is already verified',
+          },
           tests: {
             type: 'array',
             items: {
@@ -841,7 +860,8 @@ export const register: Register = (on, options) => {
     })
     await $.tool.register({
       name: 'test_update',
-      description: 'Change a manual test: its status (todo, running, passed, failed, blocked, retest), a short note shown in the pane, or new steps.',
+      description:
+        'Change a manual test: its status (todo, running, passed, failed, blocked, retest), a short note shown in the pane, new steps or a new expect. With brief and no id, replaces the brief testers read.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -849,20 +869,24 @@ export const register: Register = (on, options) => {
           status: { type: 'string', enum: [...STATUSES] },
           note: { type: 'string', description: 'One line' },
           steps: { type: 'array', items: { type: 'string' } },
+          expect: { type: 'string' },
+          brief: { type: 'string', description: 'The whole new brief' },
         },
       },
     })
     await $.tool.register({
       name: 'await_user',
-      description: 'Show the person a step to do by hand in the tests pane and wait until they press Done, Can\'t or reply. Returns their answer.',
+      description:
+        'Show the person steps to do by hand in the tests pane and wait until they answer: an option, Done, Can\'t or a reply. Returns their answer.',
       inputSchema: {
         type: 'object',
         properties: {
           id: { type: 'string', description: 'The test id; a tester may leave it out' },
-          step: { type: 'number' },
-          instruction: { type: 'string', description: 'What to do, under 100 characters' },
+          step: { type: 'number', description: 'The number of the first step shown' },
+          steps: { type: 'array', items: { type: 'string' }, description: 'Steps to do in a row before answering, each under 100 characters' },
+          instruction: { type: 'string', description: 'A single step, or the question to answer after the steps; under 100 characters' },
+          options: { type: 'array', items: { type: 'string' }, description: '2 to 4 short answers to the question; they replace Done and Can\'t' },
         },
-        required: ['instruction'],
       },
     })
     await showWaiting($)
@@ -1386,10 +1410,24 @@ export const register: Register = (on, options) => {
                     </Text>
                   </Box>
                   <Box marginLeft={2} flexDirection="column">
-                    <Text>{w.instruction}</Text>
+                    {(w.steps ?? []).map((s, i) => (
+                      <Box key={`${key}-step-${i}`}>
+                        <Text dimColor>{`${(w.step ?? 1) + i}. `}</Text>
+                        <Text>{s}</Text>
+                      </Box>
+                    ))}
+                    {w.instruction && <Text bold={(w.steps ?? []).length > 0}>{w.instruction}</Text>}
                     <Box columnGap={1} flexWrap="wrap">
-                      <Button key={`${key}-done`} variant="primary" label="Done" onPress={() => answerWait($, w.id, typed(key).trim() ? `Done. ${typed(key).trim()}` : 'Done.')} />
-                      <Button key={`${key}-cant`} label="Can't" onPress={() => answerWait($, w.id, `Can't do this step.${typed(key).trim() ? ` ${typed(key).trim()}` : ''}`)} />
+                      {(w.options ?? []).length > 0 ? (
+                        (w.options ?? []).map((o, j) => (
+                          <Button key={`${key}-opt-${j}`} label={o} onPress={() => answerWait($, w.id, typed(key).trim() ? `${o}. ${typed(key).trim()}` : o)} />
+                        ))
+                      ) : (
+                        [
+                          <Button key={`${key}-done`} variant="primary" label="Done" onPress={() => answerWait($, w.id, typed(key).trim() ? `Done. ${typed(key).trim()}` : 'Done.')} />,
+                          <Button key={`${key}-cant`} label="Can't" onPress={() => answerWait($, w.id, `Can't do this step.${typed(key).trim() ? ` ${typed(key).trim()}` : ''}`)} />,
+                        ]
+                      )}
                     </Box>
                     {Input && (
                       <Input

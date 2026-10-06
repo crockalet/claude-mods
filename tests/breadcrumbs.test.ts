@@ -202,6 +202,51 @@ describe('breadcrumbs', () => {
     await ui.unmount()
   })
 
+  test('a checkpoint shows several steps and answers with the tester\'s own options', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Cancel clears chat', steps: ['Book a ride', 'Cancel it'] }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+
+    const waiting = $.tool.call({
+      tool: 'mcp__breadcrumbs__await_user',
+      id: '1',
+      step: 1,
+      steps: ['Book a ride', 'Cancel it'],
+      instruction: 'Is the chat notification gone?',
+      options: ['Gone', 'Still there'],
+    })
+    let gone
+    for (let i = 0; i < 50 && !gone; i++) gone = await ui.find({ type: 'Button', text: 'Gone' })
+    expect(await ui.find({ type: 'Text', text: 'Cancel it' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: 'Done' })).toBeUndefined()
+    await ui.press({ key: String(gone?.key) })
+    expect((await waiting).result).toBe('The person answered: Gone')
+    await ui.unmount()
+  })
+
+  test('the planner\'s brief reaches the tester and can be revised between tests', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({
+      tool: 'mcp__breadcrumbs__test_plan',
+      brief: 'Driver build 53cb767a on the OnePlus.',
+      tests: [{ title: 'Cancel clears chat', steps: ['Cancel it'] }, { title: 'Complete clears chat', steps: ['Complete it'] }],
+    })
+    const revised = await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', brief: 'Driver build 53cb767a. Operator-panel completion sends no push.' })
+    expect(revised.result).toBe('Updated the brief.')
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '2', status: 'blocked', expect: 'Needs the driver app to complete' })
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    await ui.press({ key: 'test-2-row' })
+    expect(await ui.find({ type: 'Text', text: /expect: Needs the driver app to complete/ })).toBeDefined()
+    await ui.press({ key: 'test-1-row' })
+    await ui.press({ key: 'test-1-start' })
+    expect(submitted[0]).toContain('Test 1: Cancel clears chat\n\nBrief from the planner:\nDriver build 53cb767a. Operator-panel completion sends no push.')
+    await ui.unmount()
+  })
+
   test('a finished turn sets the task, decisions and last reply from the side pass', async ($, on) => {
     const reply = JSON.stringify({
       task: 'Fix websocket reconnect loop',

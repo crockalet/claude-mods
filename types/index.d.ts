@@ -76,11 +76,14 @@ export type Wait = {
   testId: string | null
   step: number | null
   instruction: string
+  // Absent on waits from before these fields existed.
+  steps?: string[]
+  options?: string[]
   at: number
   answer: string | null
 }
 
-export type TestRun = { tests: ManualTest[]; waits: Wait[]; unreported: string[] }
+export type TestRun = { brief: string; tests: ManualTest[]; waits: Wait[]; unreported: string[] }
 
 export type TestsView = { expanded: string | null; typed: Record<string, string> }
 

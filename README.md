@@ -23,7 +23,8 @@ Mods need Claude Code 2.1.287 or later.
 
 When you need to run tests by hand, Claude lists them in a second pane (`/tests`) with their steps. **Start tester** hands one test to a tester subagent that walks you through it, follows the logs while you go, and sends its final report to the main session, so the main agent stays the orchestrator.
 
-- Steps a tester is waiting on sit under **Waiting on you** with Done / Can't / a reply, and the status line counts them.
+- Claude plans like a planner: a shared brief every tester trusts, tests grouped by physical setup, and the remaining tests revised (or marked blocked) after each report.
+- A tester hands you a run of steps at once and stops only at checkpoints. Its questions come with their own answer buttons; plain steps get Done / Can't. You can always type a reply, and the status line counts what's waiting.
 - Feedback typed on a test goes to the step it's waiting on, else its running tester, else Claude.
 - A bare Pass costs no turn; it rides along with your next prompt.
 
