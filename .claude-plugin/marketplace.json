@@ -10,6 +10,12 @@
       "source": "./plugins/breadcrumbs",
       "description": "An always-on pane with what this session is about: the task, your last prompt, what Claude is doing and last said, and the explanations it wrote, saved as notes you can preview.",
       "version": "0.4.0"
+    },
+    {
+      "name": "secrets",
+      "source": "./plugins/secrets",
+      "description": "Hand Claude an API token without it reading the value: you type it into a field above the prompt, Claude uses it in Bash as $NAME, and it is redacted from every tool result.",
+      "version": "0.1.0"
     }
   ]
 }

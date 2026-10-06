@@ -3,12 +3,14 @@
 A marketplace of Claude Code mods, one folder each under `plugins/`. Mods need Claude Code 2.1.287 or later.
 
 - [breadcrumbs](plugins/breadcrumbs): a pane with what the session is about, your notes and manual tests
+- [secrets](plugins/secrets): hand Claude a secret it can use but never reads
 
 ## Install
 
 ```
 /plugin marketplace add crockalet/claude-mods
 /plugin install breadcrumbs@claude-mods
+/plugin install secrets@claude-mods
 ```
 
 ## Adding a mod
