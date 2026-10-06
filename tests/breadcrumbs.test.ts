@@ -406,4 +406,26 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: 'Delete the dev copy?' })).toBeDefined()
     expect(await ui.find({ key: 'ask-0-input' })).toBeDefined()
   })
+
+  test('a test_plan row shows a count, not the whole plan, and its result keeps the first sentence', async ($, on) => {
+    world(on)
+    const drawn: unknown[] = []
+    const BLANK = { type: 'Text' as const, props: {}, children: [] }
+    on('ui.render', { component: 'ToolUse' }, ($, e) => (drawn.push(e.props.input), BLANK))
+    on('ui.render', { component: 'ToolResult' }, ($, e) => (drawn.push(e.props.output), BLANK))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const tool = 'mcp__breadcrumbs__test_plan'
+    const tests = [{ title: 'One', steps: ['a'] }, { title: 'Two' }]
+    const base = { surface: 'terminal', requestId: 't1' } as const
+    const row = { tool_use_id: 't1', tool, isRunning: false, isErrored: false, isInterrupted: false }
+    await $.ui.render({ ...base, component: 'ToolUse', props: { ...row, input: { tests } } })
+    await $.ui.render({ ...base, component: 'ToolUse', props: { ...row, tool: 'Bash', input: { command: 'ls' } } })
+    const output = [{ type: 'text', text: 'Listed 2 test(s) in the tests pane (/home/dev/.agents/tests.md). Tell the user.' }]
+    await $.ui.render({ ...base, component: 'ToolResult', props: { tool_use_id: 't1', tool, isErrored: false, output } })
+    expect(drawn).toEqual([
+      { tests: '2 tests' },
+      { command: 'ls' },
+      [{ type: 'text', text: 'Listed 2 test(s) in the tests pane (/home/dev/.agents/tests.md).' }],
+    ])
+  })
 })

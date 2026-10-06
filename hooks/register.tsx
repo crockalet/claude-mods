@@ -736,6 +736,31 @@ const testTool = async ($: $, e: Record<string, unknown> & { tool: unknown; agen
   return awaitUser($, e, signal)
 }
 
+const OWN_TOOLS = [SAVE_NOTE, ...TEST_TOOLS]
+
+const briefInput = (tool: string, input: unknown): Record<string, string> | null => {
+  const i = (input ?? {}) as Record<string, unknown>
+  if (tool === SAVE_NOTE) return { title: str(i.title) }
+  if (tool === TOOL('test_plan')) {
+    const n = Array.isArray(i.tests) ? i.tests.length : 0
+    return { tests: `${n} test${n === 1 ? '' : 's'}`, ...(i.mode === 'append' ? { mode: 'append' } : {}) }
+  }
+  if (tool === TOOL('test_update') && Array.isArray(i.steps)) {
+    const { steps, ...rest } = i
+    return { ...(rest as Record<string, string>), steps: `${steps.length} steps` }
+  }
+  return null
+}
+
+// Results end with a note to the model that the person needn't read.
+const firstSentence = (output: unknown): unknown => {
+  const cut = (s: string) => s.match(/^[\s\S]*?\.(?=\s|$)/)?.[0] ?? s
+  if (typeof output === 'string') return cut(output)
+  if (Array.isArray(output))
+    return output.map(b => (b && typeof b === 'object' && typeof b.text === 'string' ? { ...b, text: cut(b.text) } : b))
+  return output
+}
+
 // Passes with nothing to say ride along with the next prompt instead of costing a turn each.
 const takePasses = async ($: $): Promise<string | null> => {
   const { unreported } = await readRun($)
@@ -991,6 +1016,17 @@ export const register: Register = (on, options) => {
     await $.ui.open({ id: PANE, title: 'breadcrumbs' })
 
     return { text: 'Breadcrumbs pane shown.' }
+  })
+
+  // The pane already shows what these calls carry, so the transcript row only needs a one-line summary.
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const input = briefInput(e.props.tool, e.props.input)
+    return next(input ? { ...e, props: { ...e.props, input } } : e)
+  })
+
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    if (!OWN_TOOLS.includes(e.props.tool) || e.props.isErrored) return next(e)
+    return next({ ...e, props: { ...e.props, output: firstSentence(e.props.output) } })
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
