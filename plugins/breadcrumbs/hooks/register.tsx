@@ -210,7 +210,7 @@ const applyClean = async ($: $, root: string, plan: CleanPlan, now: number) => {
   }
 }
 
-const cfg = { model: 'haiku', retentionDays: 30, archiveDays: 60, isArchiving: true }
+const cfg = { model: 'haiku', testerModel: 'sonnet', retentionDays: 30, archiveDays: 60, isArchiving: true }
 
 let sessionId = ''
 let dir: string | null = null
@@ -728,6 +728,7 @@ const planTests = async ($: $, e: Record<string, unknown>) => {
       trigger: str(t.trigger),
       assumes: listOf(t.assumes),
       needs: listOf(t.needs),
+      ...(str(t.model) ? { model: str(t.model) } : {}),
       status: 'todo',
       agentId: null,
       log: [],
@@ -775,6 +776,7 @@ const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string 
     trigger: trigger || old.trigger,
     assumes: assumes.length > 0 ? assumes : old.assumes,
     needs: Array.isArray(e.needs) ? listOf(e.needs) : old.needs,
+    model: str(e.model) || old.model,
   }))
   if (note || status) await logTest($, t.id, e.agentId === undefined ? 'claude' : 'tester', `${status && status !== t.status ? `${ICON[status]} ` : ''}${note || status}`)
   if (!reply) return { result: `Updated test ${t.id}.` }
@@ -917,6 +919,7 @@ const takePasses = async ($: $): Promise<string | null> => {
 
 export const register: Register = (on, options) => {
   cfg.model = String(options.model ?? 'haiku')
+  cfg.testerModel = String(options.testerModel ?? 'sonnet')
   cfg.retentionDays = Number(options.retentionDays ?? 30)
   cfg.archiveDays = Number(options.archiveDays ?? 60)
   cfg.isArchiving = options.archive !== false
@@ -1009,6 +1012,7 @@ export const register: Register = (on, options) => {
                 },
                 assumes: { type: 'array', items: { type: 'string' }, description: 'What the plan relies on that the code cannot show' },
                 needs: { type: 'array', items: { type: 'string' }, description: 'Ids of tests that must pass first' },
+                model: { type: 'string', description: 'The tester\'s model for this test, e.g. opus; leave out for the default' },
               },
               required: ['title'],
             },
@@ -1034,6 +1038,7 @@ export const register: Register = (on, options) => {
           trigger: { type: 'string' },
           assumes: { type: 'array', items: { type: 'string' } },
           needs: { type: 'array', items: { type: 'string' } },
+          model: { type: 'string' },
           reply: { type: 'string', description: 'Your answer to the tester\'s ask_planner question; the result says how to send it' },
         },
       },
@@ -1569,8 +1574,10 @@ export const register: Register = (on, options) => {
 
   on('agent.spawn', async ($, e, next) => {
     if (e.subagentType !== TESTER) return next(e)
+    const id = /^Test (\S+):/.exec(e.prompt.trim())?.[1]
+    const model = (await readRun($)).tests.find(t => t.id === id)?.model || cfg.testerModel
     // The tester waits on the person for minutes; the main agent must not block on it.
-    const spawned = await next({ ...e, background: true })
+    const spawned = await next({ ...e, background: true, ...(model === 'inherit' ? {} : { model }) })
     if (spawned.deny === undefined && spawned.agentId) await bindTester($, e.prompt, spawned.agentId)
 
     return spawned

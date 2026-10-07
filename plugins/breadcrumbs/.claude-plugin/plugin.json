@@ -1,6 +1,6 @@
 {
   "name": "breadcrumbs",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "An always-on pane with what this session is about: the task, your last prompt, what Claude is doing and last said, and the explanations it wrote, saved as notes you can preview.",
   "author": {
     "name": "crockalet"
@@ -23,6 +23,12 @@
       "title": "Side-pass model",
       "description": "The model that reads each turn to keep the task, decisions, attempts and missed explanations up to date.",
       "default": "haiku"
+    },
+    "testerModel": {
+      "type": "string",
+      "title": "Tester model",
+      "description": "The model manual-test testers run on, unless the plan sets one for a test; inherit uses the session's model.",
+      "default": "sonnet"
     },
     "retentionDays": {
       "type": "number",

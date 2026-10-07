@@ -44,7 +44,7 @@ Notes live outside your repos, one folder per session:
 ~/.agents/notes/<repo>/_pinned/   pinned notes
 ```
 
-Session folders are archived after 30 days, or as soon as their worktree is gone, and deleted 60 days after that. `/whereami clean` shows what would go and asks first. Both periods, the side-pass model and when the pane opens are settings in `/plugin`.
+Session folders are archived after 30 days, or as soon as their worktree is gone, and deleted 60 days after that. `/whereami clean` shows what would go and asks first. Both periods, the side-pass model, the testers' model (Sonnet unless a test asks for another) and when the pane opens are settings in `/plugin`.
 
 ## Developing
 

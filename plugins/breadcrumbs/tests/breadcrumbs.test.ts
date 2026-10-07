@@ -24,6 +24,7 @@ const TESTS = { ...PANE, requestId: 'tests', props: { ...PANE.props, title: 'tes
 
 const submitted: string[] = []
 const sent: string[] = []
+const spawnedModels: unknown[] = []
 
 const world = (on: On, reply = '{}', hasStore = false) => {
   const files = new Map<string, string>()
@@ -34,7 +35,7 @@ const world = (on: On, reply = '{}', hasStore = false) => {
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__breadcrumbs__${e.name}` } }))
   on('agent.register', ($, e) => ({ value: { agent: `breadcrumbs:${e.name}` } }))
-  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'agent-1' }))
+  on('agent.spawn', ($, e) => (spawnedModels.push(e.model), { model: String(e.model ?? 'sonnet'), agentId: 'agent-1' }))
   on('session.send', ($, e) => (sent.push(e.text), { isDelivered: true }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.status', () => ({ value: undefined }))
@@ -307,6 +308,16 @@ describe('breadcrumbs', () => {
     await ui.press({ key: 'test-2-row' })
     expect(await ui.find({ type: 'Text', text: /needs test 1, which failed/ })).toBeDefined()
     await ui.unmount()
+  })
+
+  test('testers run on the default tester model unless the plan picks one for a test', async ($, on) => {
+    spawnedModels.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Quick check' }, { title: 'Subtle race', model: 'opus' }] })
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: 'Test 1: Quick check', description: 'Test 1' })
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: 'Test 2: Subtle race', description: 'Test 2', model: 'haiku' })
+    expect(spawnedModels).toEqual(['sonnet', 'opus'])
   })
 
   test('the planner\'s brief reaches the tester and can be revised between tests', async ($, on) => {

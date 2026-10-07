@@ -79,6 +79,8 @@ export type ManualTest = {
   trigger?: string
   assumes?: string[]
   needs?: string[]
+  // The tester's model for this test, over the testerModel setting.
+  model?: string
 }
 
 export type Wait = {
