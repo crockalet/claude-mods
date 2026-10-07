@@ -23,6 +23,7 @@ const PANE = {
 const TESTS = { ...PANE, requestId: 'tests', props: { ...PANE.props, title: 'tests' } } as const
 
 const submitted: string[] = []
+const sent: string[] = []
 
 const world = (on: On, reply = '{}', hasStore = false) => {
   const files = new Map<string, string>()
@@ -33,8 +34,8 @@ const world = (on: On, reply = '{}', hasStore = false) => {
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__breadcrumbs__${e.name}` } }))
   on('agent.register', ($, e) => ({ value: { agent: `breadcrumbs:${e.name}` } }))
-  on('agent.spawn', () => ({ model: 'sonnet' }))
-  on('session.send', () => ({ isDelivered: true }))
+  on('agent.spawn', () => ({ model: 'sonnet', agentId: 'agent-1' }))
+  on('session.send', ($, e) => (sent.push(e.text), { isDelivered: true }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.status', () => ({ value: undefined }))
   on('classic.SessionStart', () => ({}))
@@ -248,6 +249,34 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Button', text: 'Done' })).toBeUndefined()
     await ui.press({ key: String(gone?.key) })
     expect((await waiting).result).toBe('The person answered: Gone')
+    await ui.unmount()
+  })
+
+  test('a tester stops to ask the planner, and the reply comes back for the main agent to send to that tester', async ($, on) => {
+    sent.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Search in Addu', steps: ['Search: airport'] }] })
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: 'Test 1: Search in Addu', description: 'Test 1' })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+
+    const asked = await $.tool.call({ tool: 'mcp__breadcrumbs__ask_planner', id: '1', question: 'Every search returns []; is the Addu index synced?' })
+    expect(asked.result).toContain('"[tester asks · manual test 1 · Search in Addu] Every search returns []; is the Addu index synced?"')
+    expect(await ui.find({ type: 'Text', text: 'asking Claude' })).toBeDefined()
+
+    await $.turn.complete({ answer: '[tester asks · manual test 1 · Search in Addu] Every search returns []', durationMs: 1, isAborted: false, turnId: 'a1', reason: 'answer', agentId: 'agent-1' })
+    expect(await ui.find({ key: 'test-1-row', text: /● 1/ })).toBeDefined()
+
+    const replied = await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '1', reply: 'Synced it; search again', steps: ['Search: Gan airport'] })
+    expect(replied.result).toContain('call SendMessage with to "agent-1" and exactly this message:\n\nThe planner answered: Synced it; search again\n\nSteps are now:\n1. Search: Gan airport')
+    expect(sent).toEqual([])
+    expect(await ui.find({ type: 'Text', text: 'asking Claude' })).toBeUndefined()
+
+    const resumed = await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', agentId: 'agent-1', status: 'passed', note: 'Resumed and passed' })
+    expect(resumed.result).toBe('Updated test 1.')
+
+    const late = await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '1', reply: 'Anything else?' })
+    expect(late.result).toContain('not waiting on a question')
     await ui.unmount()
   })
 
@@ -514,11 +543,14 @@ describe('breadcrumbs', () => {
     const row = { tool_use_id: 't1', tool, isRunning: false, isErrored: false, isInterrupted: false }
     await $.ui.render({ ...base, component: 'ToolUse', props: { ...row, input: { tests } } })
     await $.ui.render({ ...base, component: 'ToolUse', props: { ...row, tool: 'Bash', input: { command: 'ls' } } })
+    const update = { id: '1', reply: `Expected: Calculator can't export. Replace step 2 with these and keep going.`, steps: ['a', 'b'], expect: 'Display shows 42' }
+    await $.ui.render({ ...base, component: 'ToolUse', props: { ...row, tool: 'mcp__breadcrumbs__test_update', input: update } })
     const output = [{ type: 'text', text: 'Listed 2 test(s) in the tests pane (/home/dev/.agents/tests.md). Tell the user.' }]
     await $.ui.render({ ...base, component: 'ToolResult', props: { tool_use_id: 't1', tool, isErrored: false, output } })
     expect(drawn).toEqual([
       { tests: '2 tests' },
       { command: 'ls' },
+      { id: '1', reply: "Expected: Calculator can't export. Replace step 2 with thes…", changed: 'steps, expect' },
       [{ type: 'text', text: 'Listed 2 test(s) in the tests pane (/home/dev/.agents/tests.md).' }],
     ])
   })

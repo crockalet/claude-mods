@@ -73,6 +73,8 @@ export type ManualTest = {
   status: TestStatus
   agentId: string | null
   log: Entry[]
+  // The tester's open question to the planner; absent on tests saved before it existed.
+  asking?: string | null
 }
 
 export type Wait = {

@@ -458,7 +458,7 @@ const restoreFrom = async ($: $, from: string) => {
     // A tester or a waiting step doesn't outlive its session.
     await update($, testRun, () => ({
       brief: savedTests.brief ?? '',
-      tests: savedTests.tests.map(t => ({ ...t, status: t.status === 'running' ? 'todo' : t.status, agentId: null })),
+      tests: savedTests.tests.map(t => ({ ...t, status: t.status === 'running' ? 'todo' : t.status, agentId: null, asking: null })),
       waits: [],
       unreported: savedTests.unreported,
     }))
@@ -752,10 +752,23 @@ const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string 
   const note = str(e.note)
   const steps = listOf(e.steps)
   const expect = str(e.expect)
+  const reply = str(e.reply)
   await patchTest($, t.id, old => ({ ...old, status: status ?? old.status, steps: steps.length > 0 ? steps : old.steps, expect: expect || old.expect }))
   if (note || status) await logTest($, t.id, e.agentId === undefined ? 'claude' : 'tester', `${status && status !== t.status ? `${ICON[status]} ` : ''}${note || status}`)
+  if (!reply) return { result: `Updated test ${t.id}.` }
+  await logTest($, t.id, 'claude', `↩ ${reply}`)
+  if (!t.asking || !t.agentId) return { result: `Test ${t.id}'s tester is not waiting on a question; the reply is only in the pane log.` }
+  await patchTest($, t.id, old => ({ ...old, asking: null }))
+  const text = [
+    `The planner answered: ${reply}`,
+    steps.length > 0 ? `Steps are now:\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : '',
+    expect ? `Expected now: ${expect}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n')
 
-  return { result: `Updated test ${t.id}.` }
+  // A tester the plugin resumes from inside this hook gets no answer from this hook again, so the main agent sends it.
+  return { result: `Now resume test ${t.id}'s tester: call SendMessage with to "${t.agentId}" and exactly this message:\n\n${text}` }
 }
 
 const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }, signal: AbortSignal) => {
@@ -795,22 +808,42 @@ const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }
   return { result: `The person answered: ${answer}` }
 }
 
+// The question reaches the main agent as the tester's hand-back; a reply resumes the same tester.
+const askPlanner = async ($: $, e: Record<string, unknown> & { agentId?: string }) => {
+  const question = str(e.question)
+  if (!question) return { deny: 'ask_planner needs a question.' }
+  const t = testOf(await readRun($), e)
+  if (!t) return { deny: 'No such test: pass the id from the brief.' }
+  await patchTest($, t.id, old => ({ ...old, asking: clip(question, 200) }))
+  await logTest($, t.id, 'tester', `? ${question}`)
+
+  return {
+    result: [
+      `Your question is with the planner. End your turn now, with this as your whole final message: "[tester asks · manual test ${t.id} · ${t.title}] ${question}".`,
+      'Leave your background captures running: the planner fixes what it can and its reply resumes you in this same run.',
+    ].join(' '),
+  }
+}
+
 const testerDone = async ($: $, agentId: string, answer: string, isAborted: boolean) => {
   const t = (await readRun($)).tests.find(x => x.agentId === agentId)
   if (!t) return
+  // Stopped to ask the planner: still this test's tester, resumed by the reply.
+  if (t.asking && !isAborted) return
   const status: TestStatus = t.status === 'running' ? 'todo' : t.status
-  await patchTest($, t.id, old => ({ ...old, status, agentId: null }))
+  await patchTest($, t.id, old => ({ ...old, status, agentId: null, asking: null }))
   await mutateTests($, r => ({ ...r, waits: r.waits.filter(w => w.testId !== t.id || w.answer !== null) }))
   await showWaiting($)
   // Claude Code hands the tester's final report to the main agent itself; the pane just records it.
   await logTest($, t.id, 'tester', answer || (isAborted ? 'stopped before it reported' : 'ended without a summary'))
 }
 
-const TEST_TOOLS = [TOOL('test_plan'), TOOL('test_update'), TOOL('await_user')]
+const TEST_TOOLS = [TOOL('test_plan'), TOOL('test_update'), TOOL('await_user'), TOOL('ask_planner')]
 
 const testTool = async ($: $, e: Record<string, unknown> & { tool: unknown; agentId?: string }, signal: AbortSignal) => {
   if (e.tool === TOOL('test_plan')) return planTests($, e)
   if (e.tool === TOOL('test_update')) return updateTest($, e)
+  if (e.tool === TOOL('ask_planner')) return askPlanner($, e)
 
   return awaitUser($, e, signal)
 }
@@ -828,10 +861,17 @@ const briefInput = (tool: string, input: unknown): Record<string, string> | null
     const n = Array.isArray(i.tests) ? i.tests.length : 0
     return { tests: `${n} test${n === 1 ? '' : 's'}`, ...(i.mode === 'append' ? { mode: 'append' } : {}) }
   }
-  if (tool === TOOL('test_update') && Array.isArray(i.steps)) {
-    const { steps, ...rest } = i
-    return { ...(rest as Record<string, string>), steps: `${steps.length} steps` }
+  if (tool === TOOL('test_update')) {
+    const text = str(i.reply) || str(i.note)
+    const changed = ['steps', 'expect', 'brief'].filter(k => i[k] !== undefined)
+    return {
+      ...(str(i.id) ? { id: str(i.id) } : {}),
+      ...(str(i.status) ? { status: str(i.status) } : {}),
+      ...(text ? { [str(i.reply) ? 'reply' : 'note']: clip(text, 60) } : {}),
+      ...(changed.length > 0 ? { changed: changed.join(', ') } : {}),
+    }
   }
+  if (tool === TOOL('ask_planner')) return { question: clip(str(i.question), 60) }
   return null
 }
 
@@ -953,7 +993,7 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'test_update',
       description:
-        'Change a manual test: its status (todo, running, passed, failed, blocked, retest), a short note shown in the pane, new steps or a new expect. With brief and no id, replaces the brief testers read.',
+        'Change a manual test: its status (todo, running, passed, failed, blocked, retest), a short note shown in the pane, new steps or a new expect, or a reply to its tester\'s question. With brief and no id, replaces the brief testers read.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -963,6 +1003,7 @@ export const register: Register = (on, options) => {
           steps: { type: 'array', items: { type: 'string' } },
           expect: { type: 'string' },
           brief: { type: 'string', description: 'The whole new brief' },
+          reply: { type: 'string', description: 'Your answer to the tester\'s ask_planner question; the result says how to send it' },
         },
       },
     })
@@ -979,6 +1020,19 @@ export const register: Register = (on, options) => {
           instruction: { type: 'string', description: 'A single step, or the question to answer after the steps; under 100 characters' },
           options: { type: 'array', items: { type: 'string' }, description: '2 to 4 short answers to the question; they replace Done and Can\'t' },
         },
+      },
+    })
+    await $.tool.register({
+      name: 'ask_planner',
+      description:
+        'For a tester: ask the main agent, who planned the test, when a step is impossible, the setup breaks or a fixable failure shows up. Then end your turn with the question; the planner\'s reply, maybe with new steps, resumes you.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The test id; a tester may leave it out' },
+          question: { type: 'string', description: 'What you saw, and what you need from the planner' },
+        },
+        required: ['question'],
       },
     })
     await showWaiting($)
@@ -1594,7 +1648,11 @@ export const register: Register = (on, options) => {
                     label={`${isOpen ? '▾' : '▸'} ${ICON[t.status]} ${t.id} ${clip(t.title, width - 14)}`}
                     onPress={() => setTestsView($, old => ({ ...old, expanded: isOpen ? null : t.id }))}
                   />
-                  {wait && <Text color="warning">{wait.step !== null ? `⏳ ${wait.step}` : '⏳'}</Text>}
+                  {wait ? (
+                    <Text color="warning">{wait.step !== null ? `⏳ ${wait.step}` : '⏳'}</Text>
+                  ) : (
+                    t.asking && <Text color="claude">asking Claude</Text>
+                  )}
                 </Box>
                 {isOpen && (
                   <Box marginLeft={2} flexDirection="column">

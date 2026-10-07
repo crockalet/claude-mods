@@ -1,6 +1,6 @@
 {
   "name": "breadcrumbs",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "An always-on pane with what this session is about: the task, your last prompt, what Claude is doing and last said, and the explanations it wrote, saved as notes you can preview.",
   "author": {
     "name": "crockalet"
