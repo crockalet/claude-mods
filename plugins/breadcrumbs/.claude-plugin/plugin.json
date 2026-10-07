@@ -1,6 +1,6 @@
 {
   "name": "breadcrumbs",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "An always-on pane with what this session is about: the task, your last prompt, what Claude is doing and last said, and the explanations it wrote, saved as notes you can preview.",
   "author": {
     "name": "crockalet"
@@ -28,7 +28,13 @@
       "type": "string",
       "title": "Tester model",
       "description": "The model manual-test testers run on, unless the plan sets one for a test; inherit uses the session's model.",
-      "default": "sonnet"
+      "default": "sonnet",
+      "options": [
+        "sonnet",
+        "opus",
+        "haiku",
+        "inherit"
+      ]
     },
     "retentionDays": {
       "type": "number",
