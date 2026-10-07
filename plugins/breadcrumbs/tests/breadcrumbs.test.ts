@@ -166,7 +166,7 @@ describe('breadcrumbs', () => {
     const listed = await $.tool.call({
       tool: 'mcp__breadcrumbs__test_plan',
       tests: [
-        { title: 'Login with SSO', steps: ['Open the app', 'Tap Sign in with Google'], expect: 'Lands on home' },
+        { title: 'Login with SSO', steps: ['Open the app', 'Tap Sign in with Google'], expect: 'Lands on home', trigger: 'signIn() navigates home' },
         { title: 'Push while backgrounded', steps: ['Background the app'] },
       ],
     })
@@ -277,6 +277,35 @@ describe('breadcrumbs', () => {
 
     const late = await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '1', reply: 'Anything else?' })
     expect(late.result).toContain('not waiting on a question')
+    await ui.unmount()
+  })
+
+  test('a test needs a trigger, waits on the tests it needs, and is blocked when one fails', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const tests = [
+      { title: 'Driver goes online', steps: ['Go online'], expect: 'Offers arrive', trigger: 'goOnline() posts /driver/status' },
+      { title: 'Cash trip', steps: ['Book a ride'], expect: 'Receipt shows cash', needs: ['1'], assumes: ['One ride per driver at a time'] },
+    ]
+    const denied = await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests })
+    expect(denied.deny).toContain('Give tests 2 a trigger')
+
+    tests[1] = { ...tests[1], trigger: 'ride_ended from completeRide() in rides.ts, driver app only' } as (typeof tests)[number]
+    expect((await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests })).deny).toBeUndefined()
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    expect(await ui.find({ type: 'Text', text: /after 1/ })).toBeDefined()
+    await ui.press({ key: 'test-2-row' })
+    expect(await ui.find({ key: 'test-2-start' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /assumes: One ride per driver/ })).toBeDefined()
+
+    await ui.press({ key: 'test-1-row' })
+    await ui.press({ key: 'test-1-start' })
+    expect(submitted[0]).toContain('Trigger: goOnline() posts /driver/status')
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '1', status: 'failed', note: 'No offers' })
+    expect(await ui.find({ key: 'test-2-row', text: /⊘ 2 Cash trip/ })).toBeDefined()
+    await ui.press({ key: 'test-2-row' })
+    expect(await ui.find({ type: 'Text', text: /needs test 1, which failed/ })).toBeDefined()
     await ui.unmount()
   })
 

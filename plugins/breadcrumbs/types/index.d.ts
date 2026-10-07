@@ -75,6 +75,10 @@ export type ManualTest = {
   log: Entry[]
   // The tester's open question to the planner; absent on tests saved before it existed.
   asking?: string | null
+  // What makes the expected signal happen; absent on older tests, as are the two below.
+  trigger?: string
+  assumes?: string[]
+  needs?: string[]
 }
 
 export type Wait = {

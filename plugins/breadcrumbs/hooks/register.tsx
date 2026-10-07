@@ -4,7 +4,7 @@ import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 import type { Ask, Crumbs, Entry, ManualTest, Note, Repo, TestRun, TestStatus, TestsView, View, Wait, Where } from '../types'
 import { contextMarkdown, repoState } from './markdown'
 import { normalize } from './state'
-import { ICON, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, str, testOf } from './tests'
+import { ICON, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, settleNeeds, str, testOf, unmet } from './tests'
 import type { Saved } from './markdown'
 import { ago, asks, basename, cdTarget, clip, day, doneOf, head, narrowTables, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
@@ -601,7 +601,8 @@ const readRun = async ($: $): Promise<TestRun> => {
 
 // Kept in its own file and written only when a test changes, so a turn's save never rewrites it from an empty live list.
 const mutateTests = async ($: $, fn: (r: TestRun) => TestRun) => {
-  await update($, testRun, fn)
+  const now = await $.clock.now()
+  await update($, testRun, r => settleNeeds(fn(r), now))
   const state = await readCrumbs($)
   const target = await ensureDir($, state.tasks[0]?.title ?? 'tests')
   await $.fs.write(`${target}/tests.json`, JSON.stringify(await read($, testRun), null, 2))
@@ -685,6 +686,8 @@ const startTester = async ($: $, t: ManualTest) => {
     brief ? `Brief from the planner:\n${brief}` : '',
     t.steps.length > 0 ? `Steps:\n${t.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : '',
     t.expect ? `Expected: ${t.expect}` : '',
+    t.trigger ? `Trigger: ${t.trigger}` : '',
+    (t.assumes ?? []).length > 0 ? `Assumes:\n${(t.assumes ?? []).map(a => `- ${a}`).join('\n')}` : '',
     t.watch ? `Follow along with: ${t.watch}` : '',
     t.log.length > 0 ? `Earlier on this test:\n${t.log.map(l => `- ${l.from}: ${l.text}`).join('\n')}` : '',
   ]
@@ -722,11 +725,20 @@ const planTests = async ($: $, e: Record<string, unknown>) => {
       steps: listOf(t.steps),
       expect: str(t.expect),
       watch: str(t.watch),
+      trigger: str(t.trigger),
+      assumes: listOf(t.assumes),
+      needs: listOf(t.needs),
       status: 'todo',
       agentId: null,
       log: [],
     }))
   if (incoming.length === 0) return { deny: 'test_plan needs at least one test with a title.' }
+  const untriggered = incoming.filter(t => t.expect && !t.trigger)
+  if (untriggered.length > 0) {
+    return {
+      deny: `Give tests ${untriggered.map(t => t.id).join(', ')} a trigger: the code that produces the expected signal and what decides whether it fires, checked against the code. Write "none: <why>" when no code path is involved.`,
+    }
+  }
   const ids = new Set(incoming.map(t => t.id))
   const brief = str(e.brief)
   await mutateTests($, old => ({
@@ -753,7 +765,17 @@ const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string 
   const steps = listOf(e.steps)
   const expect = str(e.expect)
   const reply = str(e.reply)
-  await patchTest($, t.id, old => ({ ...old, status: status ?? old.status, steps: steps.length > 0 ? steps : old.steps, expect: expect || old.expect }))
+  const trigger = str(e.trigger)
+  const assumes = listOf(e.assumes)
+  await patchTest($, t.id, old => ({
+    ...old,
+    status: status ?? old.status,
+    steps: steps.length > 0 ? steps : old.steps,
+    expect: expect || old.expect,
+    trigger: trigger || old.trigger,
+    assumes: assumes.length > 0 ? assumes : old.assumes,
+    needs: Array.isArray(e.needs) ? listOf(e.needs) : old.needs,
+  }))
   if (note || status) await logTest($, t.id, e.agentId === undefined ? 'claude' : 'tester', `${status && status !== t.status ? `${ICON[status]} ` : ''}${note || status}`)
   if (!reply) return { result: `Updated test ${t.id}.` }
   await logTest($, t.id, 'claude', `↩ ${reply}`)
@@ -981,6 +1003,12 @@ export const register: Register = (on, options) => {
                 steps: { type: 'array', items: { type: 'string' }, description: 'What the person does, each under 70 characters' },
                 expect: { type: 'string', description: 'What should happen' },
                 watch: { type: 'string', description: 'Logs or watchers to follow along with' },
+                trigger: {
+                  type: 'string',
+                  description: 'The code that produces the expected signal and what decides whether it fires, e.g. "sent by completeRide() in rides.ts, driver app only"; required with expect',
+                },
+                assumes: { type: 'array', items: { type: 'string' }, description: 'What the plan relies on that the code cannot show' },
+                needs: { type: 'array', items: { type: 'string' }, description: 'Ids of tests that must pass first' },
               },
               required: ['title'],
             },
@@ -1003,6 +1031,9 @@ export const register: Register = (on, options) => {
           steps: { type: 'array', items: { type: 'string' } },
           expect: { type: 'string' },
           brief: { type: 'string', description: 'The whole new brief' },
+          trigger: { type: 'string' },
+          assumes: { type: 'array', items: { type: 'string' } },
+          needs: { type: 'array', items: { type: 'string' } },
           reply: { type: 'string', description: 'Your answer to the tester\'s ask_planner question; the result says how to send it' },
         },
       },
@@ -1639,6 +1670,7 @@ export const register: Register = (on, options) => {
           {r.tests.map(t => {
             const isOpen = v.expanded === t.id
             const wait = openWait(r, t.id)
+            const waiting = unmet(r, t)
             return (
               <Box key={`test-${t.id}`} flexDirection="column">
                 <Box justifyContent="space-between">
@@ -1650,8 +1682,10 @@ export const register: Register = (on, options) => {
                   />
                   {wait ? (
                     <Text color="warning">{wait.step !== null ? `⏳ ${wait.step}` : '⏳'}</Text>
+                  ) : t.asking ? (
+                    <Text color="claude">asking Claude</Text>
                   ) : (
-                    t.asking && <Text color="claude">asking Claude</Text>
+                    t.status === 'todo' && waiting.length > 0 && <Text dimColor>after {waiting.join(', ')}</Text>
                   )}
                 </Box>
                 {isOpen && (
@@ -1665,6 +1699,12 @@ export const register: Register = (on, options) => {
                       </Box>
                     ))}
                     {t.expect && <Text dimColor>expect: {t.expect}</Text>}
+                    {t.trigger && <Text dimColor>trigger: {t.trigger}</Text>}
+                    {(t.assumes ?? []).map((a, i) => (
+                      <Text key={`test-${t.id}-assumes-${i}`} color="warning" dimColor>
+                        assumes: {a}
+                      </Text>
+                    ))}
                     {t.log.slice(-6).map((l, i) => (
                       <Box key={`test-${t.id}-log-${i}`}>
                         <Text dimColor>{'↳ '}</Text>
@@ -1686,7 +1726,8 @@ export const register: Register = (on, options) => {
                     <Box columnGap={1} flexWrap="wrap">
                       <Button key={`test-${t.id}-pass`} label="Pass" onPress={() => markTest($, t, 'passed', typed(t.id))} />
                       <Button key={`test-${t.id}-fail`} label="Fail" onPress={() => markTest($, t, 'failed', typed(t.id))} />
-                      {t.status !== 'running' && (
+                      {t.status !== 'running' && waiting.length > 0 && <Text dimColor>waits on {waiting.join(', ')}</Text>}
+                      {t.status !== 'running' && waiting.length === 0 && (
                         <Button key={`test-${t.id}-start`} variant="primary" label={t.log.length > 0 ? 'Restart tester' : 'Start tester'} onPress={() => startTester($, t)} />
                       )}
                     </Box>

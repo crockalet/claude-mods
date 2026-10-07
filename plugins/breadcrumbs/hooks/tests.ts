@@ -11,6 +11,7 @@ export const TESTS_GUIDANCE = [
   'The user starts each test from their tests pane, where a tester subagent guides them through it and sends you its final report when it finishes.',
   'You are the planner. Give test_plan a brief that every tester reads first and trusts without re-checking: what the change does, the environment (devices, builds, servers and how to reach them), how to observe results (log tags, commands, signals known to mislead) and what is already verified.',
   'Before listing, make sure every step can actually happen, checked against the code and the setup; testers do not re-check. Do the preconditions you can check yourself (builds, deploys, registrations) instead of making them a test.',
+  'For each test, trigger names the code that produces the expected signal and what decides whether it fires ("ride_ended is sent by completeRide() in rides.ts, from the driver app only"), so a step never takes a path that skips it; assumes lists what you could not check in the code (one ride per driver at a time, how another agent will behave); needs lists ids of tests that must pass first.',
   'Group by physical setup: one setup such as a single ride can verify several behaviours, so prefer fewer, longer tests. Steps are only what the person does by hand; checks you or the tester run go in expect or watch, and each expect names a signal that tells a pass from a fail.',
   'After each tester report, revise the tests still to run with test_update: new steps or expect, status blocked with the reason when one can no longer be done or failed when an earlier result already decides it, and new facts added to the brief.',
   'A tester may hand back a question instead of a report ("[tester asks · manual test …] …"). It is paused with its setup still running, so fix what it needs if you can (rebuild, restart a server, sync data), then answer with test_update: its id and reply, plus new steps or expect if they change, and send the message it gives you to the tester with SendMessage, which resumes it. Reply "end the test" when it should stop.',
@@ -27,6 +28,7 @@ export const TESTER_PROMPT = [
   `- Hand the person steps with ${TOOL('await_user')}. Put a run of steps they can do without stopping in one call (steps, step = the first one's number), and stop only at a checkpoint: where the result decides whether the remaining steps still make sense, or where only the person can see the result (screen, notification tray).`,
   '- When you ask the person something, put the question in instruction and give 2 to 4 short answer options ("Gone", "Still there", "Not sure"). Leave options out for plain actions; they then get Done and Can\'t.',
   `- Post short observations with ${TOOL('test_update')} (note), so the person sees what you saw.`,
+  '- When an expected signal does not show, check the test\'s trigger first: say whether the steps reached that code path, and if an assumption turned out wrong, say which.',
   '- Do not edit code or config. Diagnose and propose; the main agent decides on fixes.',
   '- Before your final report, kill every background process you started; keep them while you wait on ask_planner.',
   '- When the test is settled, call test_update with status passed, failed or blocked and a one-line note, then end with at most five lines: the result, the evidence, the likely cause if it failed, and anything you learned that affects the tests still to run.',
@@ -43,6 +45,22 @@ export const str = (value: unknown) => (typeof value === 'string' ? value.trim()
 
 export const testOf = (r: TestRun, e: { id?: unknown; agentId?: string }) =>
   r.tests.find(t => (typeof e.id === 'string' && e.id ? t.id === e.id : e.agentId !== undefined && t.agentId === e.agentId))
+
+// Ids this test needs that have not passed yet.
+export const unmet = (r: TestRun, t: ManualTest): string[] =>
+  (t.needs ?? []).filter(id => r.tests.find(x => x.id === id)?.status !== 'passed')
+
+// A test whose prerequisite failed or was blocked cannot run either.
+export const settleNeeds = (r: TestRun, at: number): TestRun => ({
+  ...r,
+  tests: r.tests.map(t => {
+    if (t.status !== 'todo' && t.status !== 'retest') return t
+    const dead = r.tests.find(x => (t.needs ?? []).includes(x.id) && (x.status === 'failed' || x.status === 'blocked'))
+    if (!dead) return t
+    const text = `${ICON.blocked} needs test ${dead.id}, which ${dead.status === 'failed' ? 'failed' : 'is blocked'}`
+    return { ...t, status: 'blocked', log: [...t.log, { from: 'claude', text, at }].slice(-30) }
+  }),
+})
 
 export const isLive = (t: ManualTest) => t.status === 'running' && t.agentId !== null
 
