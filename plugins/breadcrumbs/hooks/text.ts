@@ -136,7 +136,29 @@ export const asks = (value: unknown): { question: string; context: string; optio
         })
     : []
 
-export const parseStatus = (out: string) => {
+export const DONE_TITLE = 40
+
+// One turn's results as a done entry; a single result short enough to be the title needs no list under it.
+export const doneOf = (title: unknown, items: string[], at: number): { title: string; items: string[]; at: number } | null => {
+  const named = typeof title === 'string' ? clip(title, DONE_TITLE) : ''
+  const first = items[0]
+  if (!named && first === undefined) return null
+  if (!named && items.length === 1 && first !== undefined && first.length <= DONE_TITLE) return { title: first, items: [], at }
+
+  return { title: named || clip(first ?? '', DONE_TITLE), items, at }
+}
+
+// Older state.json files stored one {text, at} per result.
+export const dones = (value: unknown): { title: string; items: string[]; at: number }[] =>
+  Array.isArray(value)
+    ? value.flatMap(v => {
+        const at = typeof v?.at === 'number' ? v.at : 0
+        const done = typeof v?.text === 'string' ? doneOf(null, [clip(v.text, 100)], at) : doneOf(v?.title, strings(v?.items, 6, 100), at)
+        return done ? [done] : []
+      })
+    : []
+
+export const parseStatus =(out: string) => {
   const [first = '', ...rest] = out.split('\n')
   const header = first.replace(/^## /, '')
   const [branchPart = '', trackPart = ''] = header.split('...')

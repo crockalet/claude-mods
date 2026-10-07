@@ -109,6 +109,32 @@ describe('breadcrumbs', () => {
     }
   })
 
+  test('edit_note changes a note in place, and saving the same title again replaces it', async ($, on) => {
+    const { files } = world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const saved = await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Plan', markdown: '- step one\n- step two\n- step two' })
+    const id = /Its id is (\S+);/.exec(String(saved.result))?.[1] ?? ''
+    const file = () => [...files.entries()].find(([p]) => p.endsWith('01-plan.md'))?.[1] ?? ''
+
+    const edited = await $.tool.call({ tool: 'mcp__breadcrumbs__edit_note', id, edits: [{ old: 'step one', new: 'step 1' }] })
+    expect(edited.deny).toBeUndefined()
+    expect(file()).toContain('- step 1\n- step two')
+    expect(file()).toContain('title: Plan\n')
+
+    const ambiguous = await $.tool.call({ tool: 'mcp__breadcrumbs__edit_note', id, edits: [{ old: 'step 1', new: 'x' }, { old: 'step two', new: 'y' }] })
+    expect(ambiguous.deny).toContain('appears 2 times')
+    expect(file()).toContain('- step 1\n')
+
+    await $.tool.call({ tool: 'mcp__breadcrumbs__edit_note', id: 'plan', markdown: 'Rewritten.' })
+    expect(file()).toContain('# Plan\n\nRewritten.\n')
+    await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Plan', markdown: 'Saved again.' })
+    expect(file()).toContain('Saved again.')
+    expect([...files.keys()].filter(p => p.endsWith('.md') && /\/\d\d-/.test(p))).toHaveLength(1)
+
+    const missing = await $.tool.call({ tool: 'mcp__breadcrumbs__edit_note', id: 'nope', markdown: 'x' })
+    expect(missing.deny).toContain('No note "nope"')
+  })
+
   test('a note table too wide for the pane is shown as a list, the file keeps the table', async ($, on) => {
     const { files } = world(on)
     await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
@@ -284,6 +310,29 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
   })
 
+  test('a turn\'s results show as one done title that expands to the list', async ($, on) => {
+    const reply = JSON.stringify({
+      task: 'Add the secrets mod',
+      done: { title: 'Added the secrets mod', items: ['Created plugins/secrets/hooks/register.tsx', 'Listed secrets in marketplace.json'] },
+    })
+    const { files, clock } = world(on, reply)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'add a secrets mod', wait: false, origin: { kind: 'composer' } })
+    await $.turn.complete({ answer: 'Added it.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    const row = await ui.find({ type: 'Button', text: '▸ Added the secrets mod' })
+    expect(row).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /register\.tsx/ })).toBeUndefined()
+    await ui.press({ key: String(row?.key) })
+    expect(await ui.find({ type: 'Text', text: 'Created plugins/secrets/hooks/register.tsx' })).toBeDefined()
+
+    const context = [...files.entries()].find(([p]) => p.endsWith('/context.md'))?.[1]
+    expect(context).toContain('- Added the secrets mod\n  - Created plugins/secrets/hooks/register.tsx')
+    await ui.unmount()
+  })
+
   test('several questions collect answers and send them together', async ($, on) => {
     submitted.length = 0
     const reply = JSON.stringify({
@@ -383,7 +432,7 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: /add dark mode to the settings screen/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /ignore me/ })).toBeUndefined()
     expect(await ui.find({ type: 'Markdown', text: /Dark mode toggle added/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Added a theme toggle to SettingsScreen.tsx' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: /^▸ Added a theme toggle/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 file edited/ })).toBeDefined()
   })
 

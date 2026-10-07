@@ -1,6 +1,6 @@
 import type { Crumbs, Where } from '../types'
 import type { Repo } from '../types'
-import { asks, basename, stamp } from './text'
+import { asks, basename, dones, stamp } from './text'
 
 export type Saved = Crumbs & { session: string; worktree: string; updatedAt: number; transcript?: string }
 
@@ -34,8 +34,8 @@ export const contextMarkdown = (saved: Saved, where: Where, status: string): str
   }
   const waiting = asks(saved.needsYou)
   if (waiting.length > 0) lines.push('## Needs you', '', ...waiting.map(a => `- [ ] ${a.question}`), '')
-  const done = saved.done ?? []
-  if (done.length > 0) lines.push('## Done', '', ...done.map(d => `- ${d.text}`), '')
+  const done = dones(saved.done)
+  if (done.length > 0) lines.push('## Done', '', ...done.flatMap(d => [`- ${d.title}`, ...d.items.map(i => `  - ${i}`)]), '')
   const repos = saved.repos ?? []
   if (repos.length > 0) {
     lines.push('## Repos', '', ...repos.map(r => `- ${basename(r.root)} · ${r.branch} · ${repoState(r)}`), '')

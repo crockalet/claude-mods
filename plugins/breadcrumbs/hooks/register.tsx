@@ -6,10 +6,11 @@ import { contextMarkdown, repoState } from './markdown'
 import { normalize } from './state'
 import { ICON, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, str, testOf } from './tests'
 import type { Saved } from './markdown'
-import { ago, asks, basename, cdTarget, clip, day, head, narrowTables, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
+import { ago, asks, basename, cdTarget, clip, day, doneOf, head, narrowTables, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
 const SAVE_NOTE = 'mcp__breadcrumbs__save_note'
+const EDIT_NOTE = 'mcp__breadcrumbs__edit_note'
 
 const crumbs = atom({ plugin: 'breadcrumbs', key: 'crumbs' } as const, normalize({}))
 const where = atom({ plugin: 'breadcrumbs', key: 'where' } as const, null)
@@ -18,6 +19,7 @@ const VIEW: View = {
   isShowingPrompts: false,
   isShowingMore: false,
   isShowingStatus: false,
+  openDone: null,
   picked: {},
   typed: {},
   details: {},
@@ -32,6 +34,7 @@ const NOTE_GUIDANCE = [
   'The user keeps a "breadcrumbs" pane open beside this session.',
   `When the user asks for an explanation, a summary, a walkthrough or a comparison, write it with the ${SAVE_NOTE} tool`,
   '(a short title and the full markdown body) instead of only in your reply, then reply with one line saying it is saved in the breadcrumbs pane.',
+  `To change a note you saved, call ${EDIT_NOTE} with its id and only the text that changes; never save the same note again.`,
   'Keep doing any task the same message asked for. Do not save notes for status updates or for answers of a sentence or two.',
   'The pane is only about 50 columns wide: write notes as headings, short paragraphs and lists, avoid tables, and keep code and diagram lines under 50 characters.',
 ].join(' ')
@@ -255,11 +258,11 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
     transcript
       ? 'Read this transcript of the session so far and answer with one JSON object and nothing else. It is a catch-up: read "this turn" below as "the session so far", allow up to 6 decisions, attempts and done items, and take needsYou only from the last assistant message.'
       : 'Read the latest exchange and answer with one JSON object and nothing else:',
-    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "context": string, "options": [{"label": string, "description": string}]}], "done": string[], "note": {"title": string, "markdown": string} | null}',
+    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "context": string, "options": [{"label": string, "description": string}]}], "done": {"title": string, "items": string[]} | null, "note": {"title": string, "markdown": string} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong or too narrow: when the prompts show the current task is one step of a bigger goal, widen it to that goal ("Verify the restart" becomes "Build the breadcrumbs mod").',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
     '- decisions: design or approach choices the assistant made on its own this turn where another option was reasonable and the user did not specify it ("Capped backoff at 30s instead of 60s"). Not actions taken, checks run or instructions given to the user. At most 3, under 90 characters each. Usually empty.',
-    '- done: concrete results of this turn, from the assistant reply and tools used, that changed something outside the conversation, past tense, naming what changed ("Pushed main to crockalet/breadcrumbs", "Installed breadcrumbs plugin (user scope)", "Fixed reconnect race in socket.ts"). Not reads, checks, explanations or plans. At most 3, under 90 characters each. Usually empty.',
+    '- done: what this turn changed outside the conversation, from the assistant reply and tools used. Not reads, checks, explanations or plans; null when nothing changed. title: the turn\'s outcome in under 40 characters, past tense ("Added the secrets mod", "Pushed main"). items: the concrete results behind it, naming what changed ("Pushed main to crockalet/breadcrumbs", "Fixed reconnect race in socket.ts"), at most 3, under 90 characters each; empty when the title says it all.',
     '- needsYou: what the assistant reply itself asks the user to answer or decide (never questions inferred from the earlier prompts or the task): explicit questions, approvals, choices between options. Each question is short, under 80 characters ("Approve the PR description?"). context: one or two sentences from the reply that someone needs to answer well (what is at stake, what each choice leads to). options: 2 to 4 when the question has discrete choices, each a short label ("Yes, I\'ll run it") and a one-line description of what that choice means, else []. Empty list when the reply asks nothing.',
     '- attempts: approaches tried this turn, isOk false when one failed or was abandoned (at most 3). Empty when none.',
     '- note: only when the user asked for an explanation or summary, the reply contains it at a paragraph or more (not a one-line answer), and it was not saved already. markdown is that explanation, kept close to the reply\'s own words. Otherwise null.',
@@ -267,6 +270,7 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
     `Current task: ${state.tasks[0]?.title ?? '(none yet)'}`,
     `Earlier prompts, oldest first (context for the task only; already handled): ${state.prompts.slice(0, -1).map(p => JSON.stringify(clip(p.text, 200))).join(' | ') || 'none'}`,
     `Already saved a note this turn: ${hasSavedNote}`,
+    `Notes saved earlier (reuse a title exactly to update that note instead of adding one): ${state.notes.map(n => JSON.stringify(n.title)).join(', ') || 'none'}`,
     `Tools used this turn: ${tools.slice(0, 30).join('; ') || 'none'}`,
     '',
     ...(transcript
@@ -301,6 +305,10 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
       tasks = [{ ...tasks[0], title: task }, ...tasks.slice(1)]
     }
 
+    const done = Array.isArray(out.done)
+      ? doneOf(null, strings(out.done, cap, 90), now)
+      : doneOf((out.done as { title?: unknown } | null)?.title, strings((out.done as { items?: unknown } | null)?.items, cap, 90), now)
+
     return {
       ...c,
       tasks,
@@ -308,7 +316,7 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
       tried: [...c.tried, ...attempts].slice(-20),
       // Haiku sometimes turns the user's own requests into questions; a reply that asks nothing has none.
       needsYou: answer.includes('?') ? asks(out.needsYou) : [],
-      done: [...c.done, ...strings(out.done, cap, 90).map(text => ({ text, at: now }))].slice(-30),
+      done: done ? [...c.done, done].slice(-30) : c.done,
     }
   })
 
@@ -332,13 +340,38 @@ const runPending = async ($: $) => {
   }
 }
 
+const noteFile = (title: string, task: string, markdown: string) =>
+  `---\ntitle: ${title.replace(/\n/g, ' ')}\ntask: ${task}\nsession: ${sessionId}\n---\n\n# ${title}\n\n${markdown.trim()}\n`
+
+const FRONTMATTER = /^---\n[\s\S]*?\n---\n+/
+
+// A rewritten note moves to the top of the list but keeps its file and number.
+const touchNote = async ($: $, id: string) => {
+  const now = await $.clock.now()
+  const pinned = (await readCrumbs($)).notes.find(n => n.id === id && n.isPinned)
+  if (pinned) await copyPinned($, pinned)
+  await mutate($, c => {
+    const note = c.notes.find(n => n.id === id)
+    return note ? { ...c, notes: [...c.notes.filter(n => n.id !== id), { ...note, at: now }] } : c
+  })
+  await save($, 'working')
+}
+
 const saveNote = async ($: $, title: string, markdown: string): Promise<Note> => {
   const state = await readCrumbs($)
-  const target = await ensureDir($, state.tasks[0]?.title ?? title)
+  const task = state.tasks[0]?.title ?? ''
+  // Saving under a title already used replaces that note rather than listing a second copy.
+  const same = state.notes.find(n => slug(n.title) === slug(title))
+  if (same) {
+    await $.fs.write(same.file, noteFile(title, task, markdown))
+    await touchNote($, same.id)
+    return same
+  }
+  const target = await ensureDir($, task || title)
   const now = await $.clock.now()
   const number = String(state.notes.length + 1).padStart(2, '0')
   const file = `${target}/${number}-${slug(title)}.md`
-  await $.fs.write(file, `---\ntitle: ${title.replace(/\n/g, ' ')}\ntask: ${state.tasks[0]?.title ?? ''}\nsession: ${sessionId}\n---\n\n# ${title}\n\n${markdown.trim()}\n`)
+  await $.fs.write(file, noteFile(title, task, markdown))
   const note: Note = { id: `${now}-${number}`, title: clip(title, 80), file, at: now, isPinned: false }
   await mutate($, c => ({ ...c, notes: [...c.notes, note] }))
   await save($, 'working')
@@ -346,11 +379,42 @@ const saveNote = async ($: $, title: string, markdown: string): Promise<Note> =>
   return note
 }
 
-const pin = async ($: $, note: Note) => {
+type NoteEdit = { old: string; new: string }
+
+const editNote = async ($: $, ref: string, edits: NoteEdit[], markdown: string): Promise<{ note: Note } | { error: string }> => {
+  const { notes } = await readCrumbs($)
+  const note = notes.find(n => n.id === ref) ?? [...notes].reverse().find(n => slug(n.title) === slug(ref))
+  if (!note) return { error: `No note "${ref}". Notes: ${notes.map(n => `${n.id} (${n.title})`).join(', ') || 'none'}.` }
+  let text: string
+  try {
+    text = await $.fs.read(note.file)
+  } catch {
+    return { error: `The file for "${note.title}" is gone; save it again with save_note.` }
+  }
+  const header = FRONTMATTER.exec(text)?.[0] ?? ''
+  let body = markdown.trim() ? `# ${note.title}\n\n${markdown.trim()}\n` : text.slice(header.length)
+  for (const edit of edits) {
+    const count = body.split(edit.old).length - 1
+    if (count !== 1) {
+      return { error: `"${clip(edit.old, 60)}" appears ${count} times in "${note.title}"; ${count === 0 ? 'copy it exactly from the note' : 'include more of the text around it'}. Nothing was changed.` }
+    }
+    body = body.replace(edit.old, () => edit.new)
+  }
+  await $.fs.write(note.file, `${header}${body}`)
+  await touchNote($, note.id)
+
+  return { note }
+}
+
+const copyPinned = async ($: $, note: Note): Promise<boolean> => {
   const place = await read($, where)
-  if (!place) return
-  const text = await $.fs.read(note.file)
-  await $.fs.write(`${await notesRoot($)}/${place.repo}/_pinned/${basename(note.file)}`, text)
+  if (!place) return false
+  await $.fs.write(`${await notesRoot($)}/${place.repo}/_pinned/${basename(note.file)}`, await $.fs.read(note.file))
+  return true
+}
+
+const pin = async ($: $, note: Note) => {
+  if (!(await copyPinned($, note))) return
   await mutate($, c => ({ ...c, notes: c.notes.map(n => (n.id === note.id ? { ...n, isPinned: true } : n)) }))
   await save($, 'working')
   $.ui.toast(`Pinned "${note.title}"`)
@@ -751,11 +815,15 @@ const testTool = async ($: $, e: Record<string, unknown> & { tool: unknown; agen
   return awaitUser($, e, signal)
 }
 
-const OWN_TOOLS = [SAVE_NOTE, ...TEST_TOOLS]
+const OWN_TOOLS = [SAVE_NOTE, EDIT_NOTE, ...TEST_TOOLS]
 
 const briefInput = (tool: string, input: unknown): Record<string, string> | null => {
   const i = (input ?? {}) as Record<string, unknown>
   if (tool === SAVE_NOTE) return { title: str(i.title) }
+  if (tool === EDIT_NOTE) {
+    const n = Array.isArray(i.edits) ? i.edits.length : 0
+    return { note: str(i.id), ...(str(i.markdown) ? { markdown: 'rewritten' } : { edits: `${n} edit${n === 1 ? '' : 's'}` }) }
+  }
   if (tool === TOOL('test_plan')) {
     const n = Array.isArray(i.tests) ? i.tests.length : 0
     return { tests: `${n} test${n === 1 ? '' : 's'}`, ...(i.mode === 'append' ? { mode: 'append' } : {}) }
@@ -816,6 +884,30 @@ export const register: Register = (on, options) => {
           markdown: { type: 'string', description: 'The full explanation in markdown' },
         },
         required: ['title', 'markdown'],
+      },
+    })
+    await $.tool.register({
+      name: 'edit_note',
+      description:
+        'Change a note saved with save_note in place, sending only the text that changes. Each edit replaces one exact, unique piece of the note; markdown instead replaces the whole body.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The id save_note returned, or the note\'s title' },
+          edits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                old: { type: 'string', description: 'Text in the note, exactly as written and found once' },
+                new: { type: 'string', description: 'What replaces it' },
+              },
+              required: ['old', 'new'],
+            },
+          },
+          markdown: { type: 'string', description: 'A whole new body, for a rewrite' },
+        },
+        required: ['id'],
       },
     })
     await $.command.register({ name: 'tests', description: 'Show or hide the manual tests pane' })
@@ -967,11 +1059,27 @@ export const register: Register = (on, options) => {
     hasSavedNote = true
     const note = await saveNote($, title, markdown)
 
-    return { result: `Saved "${note.title}" to the breadcrumbs pane (${note.file}). Tell the user in one line where to find it.` }
+    return {
+      result: `Saved "${note.title}" to the breadcrumbs pane (${note.file}). Its id is ${note.id}; change it later with edit_note. Tell the user in one line where to find it.`,
+    }
+  })
+
+  on('tool.call', { tool: EDIT_NOTE as typeof SAVE_NOTE }, async ($, e) => {
+    const i = e as Record<string, unknown>
+    const edits = (Array.isArray(i.edits) ? i.edits : []).filter(
+      (x): x is NoteEdit => typeof x?.old === 'string' && x.old !== '' && typeof x?.new === 'string',
+    )
+    const markdown = str(i.markdown)
+    if (!str(i.id) || (edits.length === 0 && !markdown)) return { deny: 'edit_note needs an id and either edits or markdown.' }
+    const edited = await editNote($, str(i.id), edits, markdown)
+    if ('error' in edited) return { deny: edited.error }
+    hasSavedNote = true
+
+    return { result: `Updated "${edited.note.title}" in the breadcrumbs pane. Tell the user in one line that it changed.` }
   })
 
   on('tool.call', async ($, e, next) => {
-    if (e.agentId !== undefined || String(e.tool) === SAVE_NOTE || TEST_TOOLS.includes(String(e.tool))) return next(e)
+    if (e.agentId !== undefined || OWN_TOOLS.includes(String(e.tool))) return next(e)
     const label = toolLabel(String(e.tool), e as Record<string, unknown>)
     turnTools.push(label)
     if (e.tool !== 'AskUserQuestion') {
@@ -1253,12 +1361,39 @@ export const register: Register = (on, options) => {
                 <Button key="status" plain dimColor label={v.isShowingStatus ? 'less' : 'more'} onPress={set({ isShowingStatus: !v.isShowingStatus })} />
               )}
             </Box>
-            {c.done.slice(v.isShowingStatus ? -12 : -3).map(d => (
-              <Box>
-                <Text color="success">{'✓ '}</Text>
-                <Text>{d.text}</Text>
-              </Box>
-            ))}
+            {c.done
+              .slice(v.isShowingStatus ? -12 : -3)
+              .reverse()
+              .map(d => {
+                const isOpen = v.openDone === d.at
+                return (
+                  <Box key={`done-${d.at}`} flexDirection="column">
+                    <Box justifyContent="space-between">
+                      <Box flexShrink={1}>
+                        <Text color="success">{'✓ '}</Text>
+                        {d.items.length > 0 ? (
+                          <Button
+                            key={`done-${d.at}-row`}
+                            plain
+                            label={`${isOpen ? '▾' : '▸'} ${clip(d.title, width - 14)}`}
+                            onPress={set({ openDone: isOpen ? null : d.at })}
+                          />
+                        ) : (
+                          <Text wrap="truncate-end">{d.title}</Text>
+                        )}
+                      </Box>
+                      <Text dimColor>{ago(d.at, now)}</Text>
+                    </Box>
+                    {isOpen &&
+                      d.items.map((item, i) => (
+                        <Box key={`done-${d.at}-item-${i}`} marginLeft={4}>
+                          <Text dimColor>{'· '}</Text>
+                          <Text dimColor>{item}</Text>
+                        </Box>
+                      ))}
+                  </Box>
+                )
+              })}
             {c.repos.map(r => {
               const state = repoState(r)
               const name = basename(r.root)

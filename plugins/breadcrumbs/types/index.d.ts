@@ -23,6 +23,9 @@ export type Repo = {
 
 export type Stamped = { text: string; at: number }
 
+// One per turn: a one-line title, with what changed listed under it.
+export type Done = { title: string; items: string[]; at: number }
+
 export type Crumbs = {
   tasks: Task[]
   prompts: Stamped[]
@@ -32,7 +35,7 @@ export type Crumbs = {
   decided: string[]
   tried: Attempt[]
   needsYou: Ask[]
-  done: Stamped[]
+  done: Done[]
   edited: string[]
   touched: string[]
   repos: Repo[]
@@ -50,6 +53,7 @@ export type View = {
   isShowingPrompts: boolean
   isShowingMore: boolean
   isShowingStatus: boolean
+  openDone: number | null
   picked: Record<string, string>
   typed: Record<string, string>
   details: Record<string, string>
