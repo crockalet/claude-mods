@@ -104,9 +104,10 @@ describe('breadcrumbs', () => {
       expect(await ui.find({ type: 'Button', text: /Why the backoff raced/ })).toBeDefined()
       const row = await ui.find({ type: 'Button', text: /Why the backoff raced/ })
       await ui.press({ key: row?.key ?? '' })
-      expect(await ui.find({ type: 'Markdown', text: /Two timers/ })).toBeDefined()
+      const kind = surface === 'terminal' ? 'Text' : 'Markdown'
+      expect(await ui.find({ type: kind, text: /Two timers/ })).toBeDefined()
       await ui.press({ key: 'close-note' })
-      expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
+      expect(await ui.find({ type: kind, text: /Two timers/ })).toBeUndefined()
       await ui.unmount()
     }
   })
@@ -149,7 +150,7 @@ describe('breadcrumbs', () => {
     await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Tables', markdown: `${wide}\n\n${narrow}` })
     expect([...files.values()].some(t => t.includes('| Need | Mod API piece |'))).toBe(true)
 
-    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'desktop', ...PANE })
     const row = await ui.find({ type: 'Button', text: /Tables/ })
     await ui.press({ key: row?.key ?? '' })
     const body = await ui.find({ type: 'Markdown', text: /Claude lays out/ })
@@ -158,6 +159,18 @@ describe('breadcrumbs', () => {
     expect(text).not.toContain('| Need |')
     expect(text).toContain('| a | b |')
     await ui.unmount()
+
+    // The terminal wraps cells, so the wide table stays a table until the pane can't give each column room.
+    const term = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await term.find({ type: 'Text', text: /^ Need +│ Mod API +│ Already in/ })).toBeDefined()
+    expect(await term.find({ type: 'Text', text: /^ a │ b$/ })).toBeDefined()
+    expect(await term.find({ type: 'Text', text: /\| a \| b \|/ })).toBeUndefined()
+    await term.unmount()
+
+    const narrowPane = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 30 } })
+    expect(await narrowPane.find({ type: 'Text', text: /^• Claude lays out/ })).toBeDefined()
+    expect(await narrowPane.find({ type: 'Text', text: /^ a │ b$/ })).toBeDefined()
+    await narrowPane.unmount()
   })
 
   test('a test plan lists tests; a bare pass rides on the next prompt and a fail goes to Claude', async ($, on) => {
@@ -362,7 +375,7 @@ describe('breadcrumbs', () => {
     const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
     expect(await ui.find({ type: 'Text', text: 'Fix websocket reconnect loop' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /fix the reconnect loop/ })).toBeDefined()
-    expect(await ui.find({ type: 'Markdown', text: /Patched the race/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Patched the race/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 dead end/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Pushed main to crockalet/breadcrumbs' })).toBeDefined()
@@ -426,7 +439,7 @@ describe('breadcrumbs', () => {
     await ui.press({ key: 'send-answers' })
 
     expect(submitted).toEqual(['Answers:\n- "Bump the major version?" — No\n- "Who should review it?" — Sam'])
-    expect(await ui.find({ type: 'Text', text: 'Bump the major version?' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^Bump the major version\?$/ })).toBeUndefined()
   })
 
   test('an opened question shows its context and full options, and sends with extra details', async ($, on) => {
@@ -500,7 +513,7 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: 'Add dark mode to settings' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /add dark mode to the settings screen/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /ignore me/ })).toBeUndefined()
-    expect(await ui.find({ type: 'Markdown', text: /Dark mode toggle added/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Dark mode toggle added/ })).toBeDefined()
     expect(await ui.find({ type: 'Button', text: /^▸ Added a theme toggle/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 file edited/ })).toBeDefined()
   })

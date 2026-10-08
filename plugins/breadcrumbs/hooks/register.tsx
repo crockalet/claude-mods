@@ -6,9 +6,36 @@ import { contextMarkdown, repoState } from './markdown'
 import { normalize } from './state'
 import { ICON, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, settleNeeds, str, testOf, unmet } from './tests'
 import type { Saved } from './markdown'
+import { richLines, type Line } from './rich'
 import { ago, asks, basename, cdTarget, clip, day, doneOf, head, narrowTables, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
+const PAD = 1
+// Below this many columns per cell a wrapped table reads worse than the same rows as a list.
+const MIN_CELL = 10
+
+// The terminal's own Markdown draws flat; there the pane lays markdown out itself in the theme's colors.
+const drawRich = (el: ReturnType<$['ui']['resolve']>, lines: Line[], dim = false) => {
+  const { Box, Text, Link } = el
+  return (
+    <Box flexDirection="column">
+      {lines.map(line => (
+        <Text wrap="truncate-end">
+          {line.length === 0
+            ? ' '
+            : line.map(s => {
+                const text = (
+                  <Text {...s.style} dimColor={dim || undefined}>
+                    {s.text}
+                  </Text>
+                )
+                return s.href ? <Link href={s.href}>{text}</Link> : text
+              })}
+        </Text>
+      ))}
+    </Box>
+  )
+}
 const SAVE_NOTE = 'mcp__breadcrumbs__save_note'
 const EDIT_NOTE = 'mcp__breadcrumbs__edit_note'
 
@@ -36,7 +63,7 @@ const NOTE_GUIDANCE = [
   '(a short title and the full markdown body) instead of only in your reply, then reply with one line saying it is saved in the breadcrumbs pane.',
   `To change a note you saved, call ${EDIT_NOTE} with its id and only the text that changes; never save the same note again.`,
   'Keep doing any task the same message asked for. Do not save notes for status updates or for answers of a sentence or two.',
-  'The pane is only about 50 columns wide: write notes as headings, short paragraphs and lists, avoid tables, and keep code and diagram lines under 50 characters.',
+  'The pane reflows notes to its current width, which the person resizes: headings, paragraphs, lists and tables all rewrap (table cells wrap), so write for reading, not for a column count. Only code and diagram lines are cut where the pane ends, so keep those short.',
 ].join(' ')
 
 type $ = EngineInterface
@@ -941,7 +968,7 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'save_note',
       description:
-        'Save an explanation, summary or walkthrough the user asked for as a markdown note in their breadcrumbs pane, so it does not get buried in the transcript. The pane is about 50 columns wide, so prefer lists to tables.',
+        'Save an explanation, summary or walkthrough the user asked for as a markdown note in their breadcrumbs pane, so it does not get buried in the transcript. The pane reflows the note to its width, tables included.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1257,7 +1284,7 @@ export const register: Register = (on, options) => {
     const place: Where | null = await read($, where)
     const v = { ...VIEW, ...(await read($, view)) }
     const now = await $.clock.now()
-    const width = Math.max(20, e.props.bodyColumns)
+    const width = Math.max(20, e.props.bodyColumns - 2 * PAD)
     const set = (patch: Partial<View>) => () => setView($, old => ({ ...old, ...patch }))
     const elements = $.ui.resolve(e)
     const Input = 'Input' in elements ? elements.Input : undefined
@@ -1281,7 +1308,7 @@ export const register: Register = (on, options) => {
     const deadEnds = c.tried.filter(t => !t.isOk).length
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} paddingX={PAD} paddingY={1}>
         {place && (
           <Text dimColor wrap="truncate-end">
             {place.branch ? `${place.repo} · ${place.branch}` : place.repo}
@@ -1436,7 +1463,11 @@ export const register: Register = (on, options) => {
               <Box>
                 <Text dimColor>{'⎿ '}</Text>
                 <Box flexShrink={1}>
-                  <Markdown key="last-said" dimColor text={head(narrowTables(c.lastSaid.text, width - 2), width * 4)} />
+                  {e.surface === 'terminal' ? (
+                    drawRich(elements, richLines(head(narrowTables(c.lastSaid.text, width - 2, MIN_CELL), width * 4), width - 2), true)
+                  ) : (
+                    <Markdown key="last-said" dimColor text={head(narrowTables(c.lastSaid.text, width - 2), width * 4)} />
+                  )}
                 </Box>
               </Box>
             )}
@@ -1531,7 +1562,11 @@ export const register: Register = (on, options) => {
             ))}
             {open && (
               <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
-                <Markdown key="note-body" text={narrowTables(openText, width - 4)} />
+                {e.surface === 'terminal' ? (
+                  drawRich(elements, richLines(narrowTables(openText, width - 4, MIN_CELL), width - 4))
+                ) : (
+                  <Markdown key="note-body" text={narrowTables(openText, width - 4)} />
+                )}
                 <Box gap={2}>
                   {!open.isPinned && <Button key="pin" label="Pin" onPress={() => pin($, open)} />}
                   <Button key="close-note" label="Close" onPress={set({ openNote: null })} />
@@ -1599,7 +1634,7 @@ export const register: Register = (on, options) => {
     const Input = 'Input' in elements ? elements.Input : undefined
     const r = await readRun($)
     const v = await read($, testsView)
-    const width = Math.max(20, e.props.bodyColumns)
+    const width = Math.max(20, e.props.bodyColumns - 2 * PAD)
     const waits = r.waits.filter(w => w.answer === null)
     const passed = r.tests.filter(t => t.status === 'passed').length
     const failed = r.tests.filter(t => t.status === 'failed').length
@@ -1608,7 +1643,7 @@ export const register: Register = (on, options) => {
 
     if (r.tests.length === 0 && waits.length === 0) {
       return (
-        <Box flexDirection="column">
+        <Box flexDirection="column" paddingX={PAD} paddingY={1}>
           <Text dimColor>No manual tests yet.</Text>
           <Text dimColor>Ask Claude for a manual test planTests and it lists the tests here.</Text>
         </Box>
@@ -1616,7 +1651,7 @@ export const register: Register = (on, options) => {
     }
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} paddingX={PAD} paddingY={1}>
         <Text dimColor>
           {r.tests.length} tests · {passed} passed{failed > 0 ? ` · ${failed} failed` : ''}
         </Text>

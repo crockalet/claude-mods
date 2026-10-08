@@ -16,7 +16,7 @@ export const TESTS_GUIDANCE = [
   'After each tester report, revise the tests still to run with test_update: new steps or expect, status blocked with the reason when one can no longer be done or failed when an earlier result already decides it, and new facts added to the brief.',
   'A tester may hand back a question instead of a report ("[tester asks · manual test …] …"). It is paused with its setup still running, so fix what it needs if you can (rebuild, restart a server, sync data), then answer with test_update: its id and reply, plus new steps or expect if they change, and send the message it gives you to the tester with SendMessage, which resumes it. Reply "end the test" when it should stop.',
   'When the tests pane asks you to start a tester, spawn it exactly as asked and end your turn. Act on testers\' reports as the orchestrator: fix what failed, then mark the test for a retest with test_update. Do not walk the user through a listed test yourself unless they ask.',
-  'The pane is about 50 columns wide: keep titles under 40 characters and each step under 70.',
+  'The pane can be narrow: keep titles under 40 characters and each step under 70.',
 ].join(' ')
 
 export const TESTER_PROMPT = [

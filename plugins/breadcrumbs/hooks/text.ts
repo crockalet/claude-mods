@@ -26,7 +26,8 @@ const cells = (row: string) =>
 const isRule = (row: string) => /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(row) && row.includes('-')
 
 // A table wider than the pane wraps into an unreadable grid, so the preview restacks it as a list.
-export const narrowTables = (markdown: string, width: number): string => {
+// With `minCell`, the drawing wraps cells itself, so only a table that can't give each column that much is restacked.
+export const narrowTables = (markdown: string, width: number, minCell?: number): string => {
   const lines = markdown.split('\n')
   const out: string[] = []
   let isFenced = false
@@ -42,7 +43,7 @@ export const narrowTables = (markdown: string, width: number): string => {
     const header = cells(line)
     const rows = lines.slice(i + 2, end).map(cells)
     const widths = header.map((h, k) => Math.max(h.length, ...rows.map(r => (r[k] ?? '').length)))
-    if (widths.reduce((sum, w) => sum + w + 3, 1) <= width) {
+    if (widths.reduce((sum, w) => sum + (minCell ? Math.min(w, minCell) : w) + 3, 1) <= width) {
       out.push(...lines.slice(i, end))
     } else {
       for (const row of rows) {
