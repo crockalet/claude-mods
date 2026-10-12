@@ -2,7 +2,7 @@
 
 A Claude Code mod that keeps a pane beside the session. Claude talks to you through it without stopping, and you can switch worktrees and pick up where you left off.
 
-- **Task**: the session's goal, kept current by a cheap side pass (Haiku) after each turn
+- **Task**: the session's goal, kept current by a cheap side pass (Haiku) after each turn, and every 90s or so during a long one
 - **Needs you**: questions Claude went on without, each with what it assumed meanwhile, and any question it's waiting on now
 - **You asked / Claude**: your last prompt, what Claude is running and the start of its last reply
 - **Notes**: explanations from Claude's replies, filed by the side pass, plus what Claude posts on purpose (a finding mid-turn, a plan or handoff it keeps current). Saved as Markdown and previewable in the pane; Pin keeps one for good

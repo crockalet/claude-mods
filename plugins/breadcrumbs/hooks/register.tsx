@@ -270,18 +270,25 @@ const clean = async ($: $) => {
   return { root, now, plan }
 }
 
-// `transcript` set means a one-off catch-up over a session that predates the mod.
-type Turn = { answer: string; hasSavedNote: boolean; tools: string[]; transcript?: string }
+// `transcript` set means a one-off catch-up over a session that predates the mod; `isPartial`, a pass while the turn still runs.
+// `said` is what Claude wrote earlier in the turn that no pass has read yet.
+type Turn = { answer: string; hasSavedNote: boolean; tools: string[]; transcript?: string; turnId?: string; said?: string; isPartial?: boolean }
 
-const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn) => {
+// Each turn's done entry, so later passes over the same turn rewrite it instead of adding rows.
+const doneAt = new Map<string, number>()
+
+const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript, turnId, said, isPartial }: Turn) => {
   const cap = transcript ? 6 : 3
   const state = await readCrumbs($)
   const prompt = state.prompts.at(-1)?.text ?? ''
+  const recorded = [...state.decided.slice(-6), ...state.tried.slice(-6).map(t => t.text)]
   const request = [
     'You keep a running log of a coding session for a developer who switches between many sessions.',
     transcript
       ? 'Read this transcript of the session so far and answer with one JSON object and nothing else. It is a catch-up: read "this turn" below as "the session so far", and allow up to 6 decisions, attempts and done items.'
-      : 'Read the latest exchange and answer with one JSON object and nothing else:',
+      : isPartial
+        ? 'The assistant is still working on this turn. Read what it has written so far and answer with one JSON object and nothing else; read "this turn" below as "this turn so far":'
+        : 'Read the latest exchange and answer with one JSON object and nothing else:',
     '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "done": {"title": string, "items": string[]} | null, "note": {"title": string, "markdown": string | null} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong or too narrow: when the prompts show the current task is one step of a bigger goal, widen it to that goal ("Verify the restart" becomes "Build the breadcrumbs mod").',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
@@ -294,22 +301,33 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
     `Earlier prompts, oldest first (context for the task only; already handled): ${state.prompts.slice(0, -1).map(p => JSON.stringify(clip(p.text, 200))).join(' | ') || 'none'}`,
     `Claude posted a note itself this turn: ${hasSavedNote} (only skip the reply's explanation when that note already holds it)`,
     `Notes saved earlier (reuse a title exactly to update that note instead of adding one): ${state.notes.map(n => JSON.stringify(n.title)).join(', ') || 'none'}`,
-    `Tools used this turn: ${tools.slice(0, 30).join('; ') || 'none'}`,
+    `Tools used this turn: ${tools.slice(-30).join('; ') || 'none'}`,
+    `Decisions and attempts already recorded (never repeat one): ${recorded.map(r => JSON.stringify(r)).join(', ') || 'none'}`,
+    ...(isPartial ? ['- note mid-turn: only a finding or explanation the developer would want now, with its markdown; null for narration of steps.'] : []),
     '',
     ...(transcript
       ? ['<transcript>', transcript, '</transcript>']
-      : ['<user_prompt>', clip(prompt, 4000), '</user_prompt>', '<assistant_reply>', answer.slice(0, 24000), '</assistant_reply>']),
+      : [
+          '<user_prompt>',
+          clip(prompt, 4000),
+          '</user_prompt>',
+          ...(said ? ['<assistant_earlier_in_turn>', said.slice(-16000), '</assistant_earlier_in_turn>'] : []),
+          ...(answer ? [isPartial ? '<assistant_latest>' : '<assistant_reply>', answer.slice(0, 24000), isPartial ? '</assistant_latest>' : '</assistant_reply>'] : []),
+        ]),
   ].join('\n')
 
+  const asked = sessionId
   const reply = await $.model.complete({ model: cfg.model, prompt: request, maxTokens: 8000, effort: 'low', timeoutMs: 60_000 })
+  // A /clear while Haiku was answering means this reply belongs to the session before it.
+  if (sessionId !== asked) return false
   if (!reply.isAnswered) {
     $.ui.log(`side pass skipped (${reply.reason})`)
-    return
+    return false
   }
   const out = parseObject(reply.text)
   if (!out) {
     $.ui.log(`side pass: unparseable reply (${clip(reply.text, 120)})`, { to: 'debug' })
-    return
+    return false
   }
 
   const now = await $.clock.now()
@@ -320,49 +338,95 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
         .slice(0, cap)
         .map(a => ({ text: clip(a.text, 100), isOk: a.isOk !== false }))
     : []
+  const at = (turnId && doneAt.get(turnId)) || now
   await mutate($, c => {
     let tasks = c.tasks
-    if (task && (tasks.length === 0 || out.isNewTask === true)) {
+    // A turn starts at most one new task, however many passes read it.
+    const isNew = out.isNewTask === true && !(turnId && doneAt.has(turnId))
+    if (task && (tasks.length === 0 || isNew)) {
       tasks = [{ title: task, at: now }, ...tasks].slice(0, 6)
     } else if (task && tasks[0]) {
       tasks = [{ ...tasks[0], title: task }, ...tasks.slice(1)]
     }
 
     const done = Array.isArray(out.done)
-      ? doneOf(null, strings(out.done, cap, 90), now)
-      : doneOf((out.done as { title?: unknown } | null)?.title, strings((out.done as { items?: unknown } | null)?.items, cap, 90), now)
+      ? doneOf(null, strings(out.done, cap, 90), at)
+      : doneOf((out.done as { title?: unknown } | null)?.title, strings((out.done as { items?: unknown } | null)?.items, cap, 90), at)
+    const kept = c.done.filter(d => d.at !== at)
+    const seen = new Set([...c.decided, ...c.tried.map(t => t.text)])
 
     return {
       ...c,
       tasks,
-      decided: [...c.decided, ...strings(out.decisions, cap, 90)].slice(-20),
-      tried: [...c.tried, ...attempts].slice(-20),
-      done: done ? [...c.done, done].slice(-30) : c.done,
+      decided: [...c.decided, ...strings(out.decisions, cap, 90).filter(d => !seen.has(d))].slice(-20),
+      tried: [...c.tried, ...attempts.filter(a => !seen.has(a.text))].slice(-20),
+      done: done ? [...kept, done].slice(-30) : c.done,
     }
   })
+  if (turnId) {
+    doneAt.set(turnId, at)
+    if (doneAt.size > 20) doneAt.delete(doneAt.keys().next().value ?? '')
+  }
 
   const note = out.note as { title?: unknown; markdown?: unknown } | null
-  // A catch-up's answer is only the last message, so it never files the whole of it.
-  const body = typeof note?.markdown === 'string' ? note.markdown : transcript ? '' : answer
+  // A catch-up's answer is only the last message, and a partial one is mostly narration, so neither files the whole of it.
+  const body = typeof note?.markdown === 'string' ? note.markdown : transcript || isPartial ? '' : answer
   const markdown = body.split('\n').filter(line => openQuestions(line).length === 0).join('\n')
   // Claude's own saves are posts and documents, not this reply, so they don't stop it being filed; Haiku sees their titles.
   if (note && typeof note.title === 'string' && markdown.trim()) {
     await saveNote($, note.title, markdown)
   }
+  return true
+}
+
+// Passes run one at a time, so the end-of-turn pass reads what a mid-turn one wrote.
+let passes: Promise<void> = Promise.resolve()
+let isPassing = false
+
+const queuePass = ($: $, run: () => Promise<void>) => {
+  passes = passes.then(async () => {
+    isPassing = true
+    try {
+      await run()
+    } catch (error) {
+      // A timer callback's rejection is otherwise swallowed without a trace.
+      $.ui.log(`side pass failed: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      isPassing = false
+    }
+  })
+  return passes
 }
 
 // Pending lives in session state, so a reload (which drops timers) can pick the pass back up.
-const runPending = async ($: $) => {
-  try {
+const runPending = ($: $) =>
+  queuePass($, async () => {
     const raw = await read($, pending)
     if (raw === null) return
     await update($, pending, () => null)
-    await sidePass($, JSON.parse(raw) as Turn)
-    await save($, 'idle')
-  } catch (error) {
-    // A timer callback's rejection is otherwise swallowed without a trace.
-    $.ui.log(`side pass failed: ${error instanceof Error ? error.message : String(error)}`)
-  }
+    if (await sidePass($, JSON.parse(raw) as Turn)) await save($, 'idle')
+  })
+
+let live = { turnId: '', said: [] as string[], toolsRead: 0, lastPass: 0 }
+const MID_PASS_MS = 90_000
+// Until the session has a task, the first pass comes sooner so the pane isn't blank through a long first turn.
+const FIRST_PASS_MS = 20_000
+
+const midPass = async ($: $, turnId: string, text: string) => {
+  const now = await $.clock.now()
+  if (live.turnId !== turnId) live = { turnId, said: [], toolsRead: turnTools.length, lastPass: now }
+  if (text) live.said.push(text)
+  if (isPassing) return
+  const hasTask = (await readCrumbs($)).tasks.length > 0
+  const isFresh = live.said.join('\n').length >= 300 || turnTools.length - live.toolsRead >= 3
+  if (!isFresh || now - live.lastPass < (hasTask ? MID_PASS_MS : FIRST_PASS_MS)) return
+  const turn: Turn = { answer: live.said.join('\n\n'), hasSavedNote, tools: [...turnTools], turnId, isPartial: true }
+  live = { turnId, said: [], toolsRead: turnTools.length, lastPass: now }
+  $.clock.after(0, () =>
+    queuePass($, async () => {
+      if (await sidePass($, turn)) await save($, 'working')
+    }),
+  )
 }
 
 const noteFile = (title: string, task: string, markdown: string) =>
@@ -499,6 +563,22 @@ const adoptResumed = async ($: $, path: string) => {
   dir = found
   await $.store.set(`dir:${sessionId}`, found)
   await restoreFrom($, found)
+}
+
+const begin = async ($: $) => {
+  sessionId = await $.session.id()
+  transcript = null
+  turnTools = []
+  hasSavedNote = false
+  live = { turnId: '', said: [], toolsRead: 0, lastPass: 0 }
+  const place = await locate($)
+  await update($, where, () => place)
+
+  const known = await $.store.get(`dir:${sessionId}`)
+  dir = typeof known === 'string' ? known : null
+  if (dir) await restoreFrom($, dir)
+  // A reload restarts the module but not the session's state, so answers still waiting come back from it.
+  outbox = (await readCrumbs($)).outbox
 }
 
 // A session that was running before the mod was installed has history but no breadcrumbs yet.
@@ -1025,15 +1105,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    sessionId = await $.session.id()
-    const place = await locate($)
-    await update($, where, () => place)
-
-    const known = await $.store.get(`dir:${sessionId}`)
-    dir = typeof known === 'string' ? known : null
-    if (dir) await restoreFrom($, dir)
-    // A reload restarts the module but not the session's state, so answers still waiting come back from it.
-    outbox = (await readCrumbs($)).outbox
+    await begin($)
 
     await $.command.register({
       name: 'whereami',
@@ -1198,6 +1270,15 @@ export const register: Register = (on, options) => {
 
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
+    // `/clear` and `/resume` go on in this process under a new session id, and no session.start fires for them.
+    if ((e.source === 'clear' || e.source === 'resume') && sessionId && (await $.session.id()) !== sessionId) {
+      await mutate($, () => normalize({}))
+      await update($, testRun, () => ({ brief: '', tests: [], waits: [], unreported: [] }))
+      await update($, pending, () => null)
+      await update($, view, () => VIEW)
+      await begin($)
+      await showWaiting($)
+    }
     if (e.transcript_path) await adoptResumed($, e.transcript_path)
 
     return done
@@ -1308,6 +1389,12 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       const found = openQuestions(step.answer)
       if (found.length > 0) await addAsks($, found)
+      const text = step.answer.trim()
+      if (text) {
+        const now = await $.clock.now()
+        await mutate($, c => ({ ...c, lastSaid: { text: head(text, 600), at: now } }))
+      }
+      await midPass($, e.turnId, text)
     }
     return step
   })
@@ -1328,8 +1415,11 @@ export const register: Register = (on, options) => {
       isWorking: false,
       lastSaid: answer ? { text: head(answer, 600), at: now } : c.lastSaid,
     }))
+    // The final step's text is the answer itself; the rest of the turn's text not yet read goes with it.
+    const said = live.turnId === e.turnId ? live.said.filter(s => s !== answer).join('\n\n') : ''
+    live = { turnId: '', said: [], toolsRead: 0, lastPass: 0 }
     if (answer && !e.isAborted) {
-      const turn: Turn = { answer, hasSavedNote, tools: turnTools }
+      const turn: Turn = { answer, hasSavedNote, tools: turnTools, turnId: e.turnId, ...(said ? { said } : {}) }
       await update($, pending, () => JSON.stringify(turn))
       // Off the turn's dispatch, so the next prompt never waits on the side pass.
       $.clock.after(0, () => runPending($))

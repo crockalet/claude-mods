@@ -9,7 +9,7 @@
       "name": "breadcrumbs",
       "source": "./plugins/breadcrumbs",
       "description": "A pane beside the session that Claude talks to you through: the task, what it is doing, the notes it files, the questions it went on without, and manual tests you run when you get to them.",
-      "version": "0.10.5"
+      "version": "0.11.0"
     },
     {
       "name": "breadcrumbs-launcher",

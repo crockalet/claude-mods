@@ -30,6 +30,9 @@ const sent: string[] = []
 const spawnedModels: unknown[] = []
 
 let stepAnswer = ''
+let sessionId = 'abc123def456'
+// Set by a test that needs a different side-pass reply per call; gets each request's prompt.
+let replyTo: ((prompt: string) => string) | null = null
 
 // One model response of the main loop, read to its end as the engine reads it.
 const step = async ($: Engine, answer: string) => {
@@ -40,6 +43,8 @@ const step = async ($: Engine, answer: string) => {
 }
 
 const world = (on: On, reply = '{}', hasStore = false) => {
+  sessionId = 'abc123def456'
+  replyTo = null
   const files = new Map<string, string>()
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/dev' })
@@ -54,7 +59,7 @@ const world = (on: On, reply = '{}', hasStore = false) => {
   on('ui.status', () => ({ value: undefined }))
   on('classic.SessionStart', () => ({}))
   on('ui.toast', () => ({ value: undefined }))
-  on('session.id', () => ({ value: 'abc123def456' }))
+  on('session.id', () => ({ value: sessionId }))
   on('session.cwd', () => ({ value: '/code/feat-sync' }))
   on('session.repo', () => ({ value: { root: '/code/acme-app', remote: null, internal: false, name: null } }))
   on('process.run', async ($, e) => {
@@ -84,8 +89,8 @@ const world = (on: On, reply = '{}', hasStore = false) => {
     return { value: [...names].map(name => ({ name, kind: [...files.keys()].some(k => k.startsWith(`${prefix}${name}/`)) ? ('dir' as const) : ('file' as const), size: 0, mtimeMs: 0, isLink: false })) }
   })
   on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
-  on('model.complete', () => ({
-    value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+  on('model.complete', ($, e) => ({
+    value: { isAnswered: true, text: replyTo ? replyTo(e.prompt) : reply, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
   }))
   on('turn.complete', () => ({ text: '' }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -567,6 +572,65 @@ describe('breadcrumbs', () => {
     const context = [...files.entries()].find(([p]) => p.endsWith('/context.md'))
     expect(context?.[1]).toContain('# Fix websocket reconnect loop')
     expect(context?.[1]).toContain('- ✗ Patch A with a mutex')
+  })
+
+  test('a long turn fills the pane while it runs, and its passes share one done row', async ($, on) => {
+    const { clock } = world(on)
+    const asked: string[] = []
+    const replies = [
+      { task: 'Fix websocket reconnect loop', decisions: ['Capped backoff at 30s'], done: { title: 'Patched socket.ts', items: [] } },
+      { task: 'Fix websocket reconnect loop', decisions: ['Capped backoff at 30s'], done: { title: 'Fixed the reconnect race', items: ['Patched socket.ts', 'Added a reconnect test'] } },
+    ]
+    replyTo = prompt => (asked.push(prompt), JSON.stringify(replies[asked.length - 1] ?? {}))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'fix the reconnect loop', wait: false, origin: { kind: 'composer' } })
+    await $.turn.start({ text: 'fix the reconnect loop', turnId: 't1' })
+
+    await step($, 'Found it: two timers both reconnect after a drop. '.repeat(8))
+    await clock.settle()
+    expect(asked).toEqual([])
+    await clock.advance(25_000)
+    await step($, 'Patching socket.ts now.')
+    await clock.settle()
+    expect(asked).toHaveLength(1)
+    expect(asked[0]).toContain('still working on this turn')
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: 'Fix websocket reconnect loop' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Patching socket\.ts now/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Patched socket.ts' })).toBeDefined()
+    await ui.unmount()
+
+    await $.turn.complete({ answer: 'Fixed the race and added a test.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+    expect(asked).toHaveLength(2)
+    expect(asked[1]).toContain('<assistant_reply>\nFixed the race and added a test.')
+    expect(asked[1]).not.toContain('Found it')
+
+    const after = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await after.find({ type: 'Button', text: '▸ Fixed the reconnect race' })).toBeDefined()
+    expect(await after.find({ type: 'Text', text: 'Done · 1' })).toBeDefined()
+    expect(await after.find({ type: 'Text', text: /^1 decided/ })).toBeDefined()
+    await after.unmount()
+  })
+
+  test('/clear starts the pane and its folder over under the new session id', async ($, on) => {
+    const { files } = world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Before clear', markdown: 'Old.' })
+
+    sessionId = 'fff999eee888'
+    await $.classic.SessionStart({ source: 'clear', transcript_path: '/t/new.jsonl' })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'After clear', markdown: 'New.' })
+
+    const note = [...files.keys()].find(p => p.endsWith('/01-after-clear.md')) ?? ''
+    expect(note).toMatch(/-fff999\/01-after-clear\.md$/)
+    expect(files.get(note)).toContain('session: fff999eee888')
+    expect([...files.keys()].some(p => p.endsWith('-fff999/state.json'))).toBe(true)
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Button', text: /Before clear/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', text: /After clear/ })).toBeDefined()
+    await ui.unmount()
   })
 
   test('a turn\'s results show as one done title that expands to the list', async ($, on) => {
