@@ -174,10 +174,10 @@ describe('secrets', () => {
   test('rows are scrubbed before the transcript keeps them', async ($, on) => {
     world(on)
     const kept: unknown[] = []
-    // The kit has no store beneath session.append, so the call rejects after this records what reached the bottom.
-    on('session.append', ($, e) => {
+    // A session.append hook must pass the row on; the kit has no store beneath it, so the call rejects after this records what reached the bottom.
+    on('session.append', ($, e, next) => {
       kept.push(e.message)
-      return { message: e.message, uuid: e.uuid }
+      return next(e)
     })
     await start($)
     await provide($, 'GITHUB_TOKEN', VALUE)
