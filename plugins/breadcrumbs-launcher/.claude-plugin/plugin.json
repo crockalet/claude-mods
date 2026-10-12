@@ -1,0 +1,9 @@
+{
+  "name": "breadcrumbs-launcher",
+  "version": "0.1.0",
+  "description": "Starts breadcrumbs' manual-test testers the moment you press Start, without going through the main agent.",
+  "author": {
+    "name": "crockalet"
+  },
+  "repository": "https://github.com/crockalet/claude-mods/tree/main/plugins/breadcrumbs-launcher"
+}

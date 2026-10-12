@@ -1,5 +1,8 @@
 import type { On } from 'claude-code'
+
+import { openQuestions } from '../hooks/text'
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 // The test runtime has timers; its types don't declare them.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -25,6 +28,16 @@ const TESTS = { ...PANE, requestId: 'tests', props: { ...PANE.props, title: 'tes
 const submitted: string[] = []
 const sent: string[] = []
 const spawnedModels: unknown[] = []
+
+let stepAnswer = ''
+
+// One model response of the main loop, read to its end as the engine reads it.
+const step = async ($: Engine, answer: string) => {
+  stepAnswer = answer
+  const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+  for await (const _ of stream);
+  return stream.result
+}
 
 const world = (on: On, reply = '{}', hasStore = false) => {
   const files = new Map<string, string>()
@@ -75,6 +88,12 @@ const world = (on: On, reply = '{}', hasStore = false) => {
     value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
   }))
   on('turn.complete', () => ({ text: '' }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.step', async function* ($, e) {
+    return { turnId: e.turnId, index: e.index, answer: stepAnswer, toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: 'ok', stderr: '', interrupted: false } }))
+  on('tool.call', ($, e, next) => (e.tool === 'SubagentHandback' ? ({ result: 'handed back' } as never) : next(e)))
   on('prompt.submit', ($, e) => {
     submitted.push(e.text)
     return { text: e.text, context: e.context }
@@ -220,6 +239,74 @@ describe('breadcrumbs', () => {
     await ui.unmount()
   })
 
+  test('with the launcher running, Start tester leaves it a request instead of asking Claude', async ($, on) => {
+    submitted.length = 0
+    const { files } = world(on)
+    const launch = '/home/dev/.agents/notes/.launch/abc123def456'
+    files.set(`${launch}/ready`, String(NOW))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Push while backgrounded', steps: ['Background the app'] }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    await ui.press({ key: 'test-1-row' })
+    await ui.press({ key: 'test-1-start' })
+
+    expect(submitted).toEqual([])
+    const request = JSON.parse([...files.entries()].find(([p]) => p.startsWith(`${launch}/`) && p.endsWith('.json'))?.[1] ?? '{}')
+    expect(request.subagentType).toBe('breadcrumbs:tester')
+    expect(request.description).toBe('Test 1: Push while backgrounded')
+    expect(request.prompt).toContain('Test 1: Push while backgrounded\n\nSteps:\n1. Background the app')
+
+    // The launcher's spawn passes through this plugin's own hook, which binds the tester to its test.
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: request.prompt, description: request.description })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', agentId: 'agent-1', note: 'Capturing logs' })
+    expect(await ui.find({ type: 'Text', text: /tester: Capturing logs/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a request the launcher never takes, or a launcher gone quiet, falls back to Claude', async ($, on) => {
+    submitted.length = 0
+    const { files, clock } = world(on)
+    const launch = '/home/dev/.agents/notes/.launch/abc123def456'
+    files.set(`${launch}/ready`, String(NOW))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'One' }, { title: 'Two' }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    await ui.press({ key: 'test-1-row' })
+    await ui.press({ key: 'test-1-start' })
+    expect(submitted).toEqual([])
+    await clock.advance(15_000)
+    expect(submitted).toHaveLength(1)
+    expect(submitted[0]).toContain('subagent_type "breadcrumbs:tester"')
+
+    // Its last stamp is now older than the launcher's heartbeat allows.
+    await clock.advance(90_000)
+    await ui.press({ key: 'test-2-row' })
+    await ui.press({ key: 'test-2-start' })
+    expect(submitted).toHaveLength(2)
+    expect(submitted[1]).toContain('Test 2: Two')
+    await ui.unmount()
+  })
+
+  test('tests added later join the list, with fresh ids when theirs are taken', async ($, on) => {
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ id: '1', title: 'Login' }] })
+    const later = await $.tool.call({
+      tool: 'mcp__breadcrumbs__test_plan',
+      tests: [{ id: '1', title: 'Logout' }, { id: '2', title: 'Log back in', needs: ['1'] }],
+    })
+    expect(later.result).toContain('2 Logout; 3 Log back in')
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+    expect(await ui.find({ key: 'test-1-row', text: /Login/ })).toBeDefined()
+    expect(await ui.find({ key: 'test-2-row', text: /Logout/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'after 2' })).toBeDefined()
+
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', mode: 'replace', tests: [{ title: 'Fresh start' }] })
+    expect(await ui.find({ type: 'Text', text: /^1 tests/ })).toBeDefined()
+    await ui.unmount()
+  })
+
   test('a step waits in the pane until Done and returns what the person typed', async ($, on) => {
     submitted.length = 0
     world(on)
@@ -230,12 +317,12 @@ describe('breadcrumbs', () => {
     const waiting = $.tool.call({ tool: 'mcp__breadcrumbs__await_user', id: '1', step: 1, instruction: 'Background the app' })
     let card
     for (let i = 0; i < 50 && !card; i++) card = await ui.find({ type: 'Button', text: 'Done' })
-    expect(await ui.find({ type: 'Text', text: /Waiting on you · 1/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '⏳ 1' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /⏳ 1 waiting on you/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '⏳ step 1' })).toBeDefined()
     await ui.input({ key: String(card?.key).replace(/-done$/, '-input'), text: 'banner showed', kind: 'change' })
     await ui.press({ key: String(card?.key) })
     expect((await waiting).result).toBe('The person answered: Done. banner showed')
-    expect(await ui.find({ type: 'Text', text: /Waiting on you/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /waiting on you/ })).toBeUndefined()
 
     await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', id: '1', status: 'retest', note: 'Fixed the token refresh' })
     expect(await ui.find({ type: 'Text', text: /claude: ⟳ Fixed the token refresh/ })).toBeDefined()
@@ -263,6 +350,102 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Button', text: 'Done' })).toBeUndefined()
     await ui.press({ key: String(gone?.key) })
     expect((await waiting).result).toBe('The person answered: Gone')
+    await ui.unmount()
+  })
+
+  test('a closed test starts from its row, and its waiting step shows under the title without opening it', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Login', steps: ['Log in'] }, { title: 'Logout', steps: ['Log out'] }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+
+    expect(await ui.find({ key: 'test-2-start', text: '▶ start' })).toBeDefined()
+    await ui.press({ key: 'test-2-start' })
+    expect(submitted.at(-1)).toContain('Test 2: Logout')
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: 'Test 2: Logout', description: 'Test 2' } as never)
+    if (await ui.find({ type: 'Text', text: 'Log out' })) await ui.press({ key: 'test-2-row' })
+    expect(await ui.find({ key: 'test-2-start' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'running' })).toBeDefined()
+    const rows = await ui.findAll({ type: 'Button', text: /^[▸▾]/ })
+    expect(rows.map(b => b.key)).toEqual(['test-2-row', 'test-1-row'])
+
+    const waiting = $.tool.call({ tool: 'mcp__breadcrumbs__await_user', id: '2', step: 1, instruction: 'Did the session end?', options: ['Yes', 'No'] })
+    let yes
+    for (let i = 0; i < 50 && !yes; i++) yes = await ui.find({ type: 'Button', text: 'Yes' })
+    if (await ui.find({ type: 'Text', text: 'Log out' })) await ui.press({ key: 'test-2-row' })
+    expect(await ui.find({ type: 'Button', text: 'Yes' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Log out' })).toBeUndefined()
+    await ui.press({ key: String(yes?.key) })
+    expect((await waiting).result).toBe('The person answered: Yes')
+    await ui.unmount()
+  })
+
+  test('stop ends a running tester at once: its step returns, and every later call but a cleanup kill is refused', async ($, on) => {
+    sent.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Login', steps: ['Log in'] }, { title: 'Logout', steps: ['Log out'] }] })
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: 'Test 1: Login', description: 'Test 1' } as never)
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+
+    const waiting = $.tool.call({ tool: 'mcp__breadcrumbs__await_user', agentId: 'agent-1', id: '1', step: 1, instruction: 'Log in' } as never)
+    for (let i = 0; i < 50 && !(await ui.find({ type: 'Button', text: 'Done' })); i++);
+    expect(await ui.find({ key: 'test-1-stop', text: '■ stop' })).toBeDefined()
+    await ui.press({ key: 'test-1-stop' })
+    expect(String((await waiting).result)).toContain('The person stopped this test.')
+
+    const read = await $.tool.call({ tool: 'Read', agentId: 'agent-1', file_path: '/code/feat-sync/a.ts' } as never)
+    expect(read.deny).toContain('The person stopped this test.')
+    const kill = await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'kill 4242' } as never)
+    expect(kill.deny).toBeUndefined()
+    // The hand-back is how the tester reports and ends; refusing it left a stopped tester retrying forever.
+    const handback = await $.tool.call({ tool: 'SubagentHandback', agentId: 'agent-1', message: 'Stopped before any step ran.' } as never)
+    expect(handback.deny).toBeUndefined()
+    expect(await ui.find({ key: 'test-1-start', text: '▶ restart' })).toBeDefined()
+
+    expect(await ui.find({ key: 'test-1-stop' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /tester: Stopped before any step ran\./ })).toBeDefined()
+    await $.turn.complete({ answer: 'Stopped before any step ran.', durationMs: 1, isAborted: false, turnId: 'a1', reason: 'answer', agentId: 'agent-1' })
+    const after = await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'ls' } as never)
+    expect(after.deny).toBeUndefined()
+
+    submitted.length = 0
+    await ui.press({ key: 'test-1-start' })
+    expect(submitted.at(-1)).toContain('Earlier runs of this test (history only; this is a fresh run, so start the steps):\n- you: ■ stopped the tester')
+
+    await $.agent.spawn({ subagentType: 'breadcrumbs:tester', prompt: 'Test 2: Logout', description: 'Test 2' } as never)
+    await ui.press({ key: 'test-2-row' })
+    await ui.press({ key: 'test-2-pass' })
+    expect(sent.at(-1)).toContain('The person marked this test passed.')
+    expect(await ui.find({ key: 'test-2-row', text: /✓ 2/ })).toBeDefined()
+    expect((await $.tool.call({ tool: 'mcp__breadcrumbs__test_update', agentId: 'agent-1', id: '2', status: 'failed' } as never)).deny).toContain('marked this test passed')
+    await ui.unmount()
+  })
+
+  test('a long command in a step is shown whole and copies with one press', async ($, on) => {
+    const copied: string[] = []
+    world(on)
+    on('ui.copy', ($, e) => (copied.push(e.text), { value: { isCopied: true } }))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    const command = 'cd ~/repos/plugins/breadcrumbs && claude --plugin-dir plugins/breadcrumbs --plugin-dir plugins/breadcrumbs-launcher'
+    await $.tool.call({ tool: 'mcp__breadcrumbs__test_plan', tests: [{ title: 'Dev session', steps: [`In a new terminal run: ${command}`] }] })
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
+
+    const waiting = $.tool.call({ tool: 'mcp__breadcrumbs__await_user', id: '1', step: 1, steps: [`Open a new terminal and run \`${command}\``, 'Paste: `/tests`'] })
+    let copy
+    for (let i = 0; i < 50 && !copy; i++) copy = await ui.find({ type: 'Button', text: '⧉ copy' })
+    expect(await ui.find({ type: 'Text', text: `Open a new terminal and run \`${command}\`` })).toBeDefined()
+    await ui.press({ key: String(copy?.key) })
+    expect(copied).toEqual([command])
+    await ui.press({ key: String(copy?.key).replace('step-0', 'step-1') })
+    expect(copied).toEqual([command, '/tests'])
+
+    await ui.press({ key: String((await ui.find({ type: 'Button', text: 'Done' }))?.key) })
+    await waiting
+    // The waiting step opened the test, so its own steps are drawn with their copy buttons too.
+    await ui.press({ key: 'test-1-step-0-copy-0' })
+    expect(copied.at(-1)).toBe(command)
     await ui.unmount()
   })
 
@@ -361,7 +544,6 @@ describe('breadcrumbs', () => {
       isNewTask: false,
       decisions: ['Capped backoff at 30s'],
       attempts: [{ text: 'Patch A with a mutex', isOk: false }],
-      needsYou: [{ question: 'Approve the PR description?', options: ['Yes, approve it as written', 'No'] }],
       done: ['Pushed main to crockalet/breadcrumbs'],
       note: null,
     })
@@ -377,7 +559,7 @@ describe('breadcrumbs', () => {
     expect(await ui.find({ type: 'Text', text: /fix the reconnect loop/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Patched the race/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /1 dead end/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Needs you' })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: 'Pushed main to crockalet/breadcrumbs' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '1 uncommitted · ↑1 unpushed' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /❯/ })).toBeUndefined()
@@ -385,11 +567,6 @@ describe('breadcrumbs', () => {
     const context = [...files.entries()].find(([p]) => p.endsWith('/context.md'))
     expect(context?.[1]).toContain('# Fix websocket reconnect loop')
     expect(context?.[1]).toContain('- ✗ Patch A with a mutex')
-    expect(context?.[1]).toContain('- [ ] Approve the PR description?')
-
-    await ui.press({ key: 'ask-0-opt-0' })
-    expect(submitted.at(-1)).toBe('Re: "Approve the PR description?" — Yes, approve it as written')
-    expect(await ui.find({ type: 'Text', text: 'Approve the PR description?' })).toBeUndefined()
   })
 
   test('a turn\'s results show as one done title that expands to the list', async ($, on) => {
@@ -415,68 +592,112 @@ describe('breadcrumbs', () => {
     await ui.unmount()
   })
 
-  test('several questions collect answers and send them together', async ($, on) => {
-    submitted.length = 0
-    const reply = JSON.stringify({
-      task: 'Ship the release',
-      needsYou: [
-        { question: 'Bump the major version?', options: ['Yes', 'No'] },
-        { question: 'Who should review it?', options: [] },
-      ],
-    })
-    const { clock } = world(on, reply)
-    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
-    await $.prompt.submit({ text: 'ship it', wait: false, origin: { kind: 'composer' } })
-    await $.turn.complete({ answer: 'Ready to ship. Bump the major version? Who should review it?', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
-    await clock.settle()
-    submitted.length = 0
-
-    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
-    await ui.press({ key: 'ask-0-opt-1' })
-    expect(submitted).toEqual([])
-    expect(await ui.find({ key: 'ask-0-opt-1', text: '✓ No' })).toBeDefined()
-    await ui.input({ key: 'ask-1-input', text: 'Sam', kind: 'change' })
-    await ui.press({ key: 'send-answers' })
-
-    expect(submitted).toEqual(['Answers:\n- "Bump the major version?" — No\n- "Who should review it?" — Sam'])
-    expect(await ui.find({ type: 'Text', text: /^Bump the major version\?$/ })).toBeUndefined()
+  test('open questions are read from Claude\'s lines, options and assumption included', async () => {
+    const reply = [
+      'Patched the race.',
+      'Open question: Which cache TTL? [5m | 1h] (assuming 5m)',
+      '- **Open question:** Rename the flag to `isLive`?',
+      '**Open questions:**',
+      'Open questions remain about the rollout.',
+      '**Open question**: Ship behind a flag?',
+      '```',
+      'Open question: not this one, it is code',
+      '```',
+      'Is this a question? It is not an open one.',
+    ].join('\n')
+    expect(openQuestions(reply)).toEqual([
+      { question: 'Which cache TTL?', context: '', options: ['5m', '1h'], optionNotes: ['', ''], assumption: '5m' },
+      { question: 'Rename the flag to `isLive`?', context: '', options: [], optionNotes: [], assumption: '' },
+      { question: 'Ship behind a flag?', context: '', options: [], optionNotes: [], assumption: '' },
+    ])
   })
 
-  test('an opened question shows its context and full options, and sends with extra details', async ($, on) => {
+  test('a question asked mid-turn shows at once, and its answer rides on Claude\'s next tool result instead of a turn', async ($, on) => {
     submitted.length = 0
-    const long = 'No, assume trip fares include tips and move on to the dashboard'
-    const reply = JSON.stringify({
-      task: 'Reconcile payouts',
-      needsYou: [
-        {
-          question: 'Run the megatron query to check payout_amount?',
-          context: 'Payouts look high; the query tells us whether tips are counted twice.',
-          options: [
-            { label: "Yes, I'll run it", description: 'You run it and paste the result back' },
-            { label: long, description: 'Skip the check and proceed' },
-          ],
-        },
-      ],
-    })
-    const { clock } = world(on, reply)
+    world(on)
     await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
-    await $.prompt.submit({ text: 'check payouts', wait: false, origin: { kind: 'composer' } })
-    await $.turn.complete({ answer: 'Two ways to go. Run the megatron query?', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
-    await clock.settle()
-    submitted.length = 0
+    await $.turn.start({ text: 'speed up the cache', turnId: 't1' })
+    await step($, 'Starting on the cache.\nOpen question: Which cache TTL? [5m | 1h] (assuming 5m)')
 
     const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
-    expect(await ui.find({ key: 'ask-0-opt-1', text: long })).toBeUndefined()
-    await ui.press({ key: 'ask-0-more' })
-    expect(await ui.find({ type: 'Text', text: /tips are counted twice/ })).toBeDefined()
-    expect(await ui.find({ key: 'ask-0-opt-1', text: long })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'You run it and paste the result back' })).toBeDefined()
-
-    await ui.press({ key: 'ask-0-opt-0' })
+    expect(await ui.find({ type: 'Text', text: 'Which cache TTL?' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'going with 5m' })).toBeDefined()
+    await ui.press({ key: 'ask-0-opt-1' })
     expect(submitted).toEqual([])
-    await ui.input({ key: 'ask-0-details', text: 'use the prod replica', kind: 'change' })
-    await ui.press({ key: 'send-answers' })
-    expect(submitted).toEqual([`Re: "Run the megatron query to check payout_amount?" — Yes, I'll run it (details: use the prod replica)`])
+    expect(await ui.find({ type: 'Text', text: /Which cache TTL\? — 1h/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /after its next step/ })).toBeDefined()
+    expect(await ui.find({ key: 'send-now' })).toBeUndefined()
+
+    const ran = await $.tool.call({ tool: 'Bash', command: 'npm test' })
+    expect(ran.context).toEqual(['The user answered your open question "Which cache TTL?" in the breadcrumbs pane: 1h'])
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /— 1h/ })).toBeUndefined()
+
+    // The final reply repeating the line doesn't ask it again.
+    await step($, 'Done, using 1h.\nOpen question: Which cache TTL? [5m | 1h] (assuming 5m)')
+    expect(await ui.find({ type: 'Text', text: 'Which cache TTL?' })).toBeUndefined()
+    expect(submitted).toEqual([])
+    await ui.unmount()
+  })
+
+  test('an answer given while Claude is idle goes with the next prompt, or now with send now', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await step($, 'Open question: Who should review it?\nOpen question: Bump the major version? [Yes | No] (assuming no)')
+    await $.turn.complete({ answer: 'Shipped.', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    await ui.input({ key: 'ask-0-input', text: 'Sam' })
+    expect(submitted).toEqual([])
+    expect(await ui.find({ type: 'Text', text: /with your next prompt/ })).toBeDefined()
+    const next = await $.prompt.submit({ text: 'also update the changelog', wait: false, origin: { kind: 'composer' } })
+    expect(next.context).toEqual(['The user answered your open question "Who should review it?" in the breadcrumbs pane: Sam'])
+
+    // A prompt doesn't clear what is still open.
+    await ui.press({ key: 'ask-0-opt-0' })
+    await ui.press({ key: 'send-now' })
+    expect(submitted.at(-1)).toBe('The user answered your open question "Bump the major version?" in the breadcrumbs pane: Yes')
+    expect(await ui.find({ type: 'Text', text: 'Needs you' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a question Claude went ahead on can be left as it is', async ($, on) => {
+    submitted.length = 0
+    world(on)
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await step($, 'Open question: Keep the old endpoint for a release? (assuming yes)')
+    const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...PANE })
+    await ui.press({ key: 'ask-0-dismiss' })
+    expect(await ui.find({ type: 'Text', text: 'Needs you' })).toBeUndefined()
+    expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).context).toBeUndefined()
+    expect(submitted).toEqual([])
+    await ui.unmount()
+  })
+
+  test('the side pass files an explanation from the reply itself, without its open questions', async ($, on) => {
+    const { files, clock } = world(on, JSON.stringify({ task: 'Explain the reconnect', note: { title: 'How reconnect works', markdown: null } }))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'how does reconnect work?', wait: false, origin: { kind: 'composer' } })
+    const answer = 'Reconnect backs off **exponentially**, capped at 30s.\n\nOpen question: Cap it at 60s instead? (assuming 30s)'
+    await $.turn.complete({ answer, durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+
+    const note = [...files.entries()].find(([p]) => p.endsWith('01-how-reconnect-works.md'))?.[1] ?? ''
+    expect(note).toContain('Reconnect backs off **exponentially**, capped at 30s.')
+    expect(note).not.toContain('Open question')
+  })
+
+  test('a note Claude posts mid-turn doesn\'t stop the reply\'s explanation being filed', async ($, on) => {
+    const { files, clock } = world(on, JSON.stringify({ task: 'Fix reconnect', note: { title: 'Why reconnect raced', markdown: null } }))
+    await $.session.start({ cwd: '/code/feat-sync', surface: null, isInteractive: false })
+    await $.prompt.submit({ text: 'fix reconnect and tell me why it raced', wait: false, origin: { kind: 'composer' } })
+    await $.tool.call({ tool: 'mcp__breadcrumbs__save_note', title: 'Heads-up: prod config', markdown: 'Staging points at the prod queue.' })
+    await $.turn.complete({ answer: 'Two timers both reconnected, so the second one raced the first.', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.settle()
+
+    const notes = [...files.keys()].filter(p => /\/\d\d-[^/]+\.md$/.test(p)).map(p => p.split('/').pop())
+    expect(notes).toEqual(['01-heads-up-prod-config.md', '02-why-reconnect-raced.md'])
   })
 
   test('a reply that asks nothing leaves nothing under needs you', async ($, on) => {
@@ -531,7 +752,7 @@ describe('breadcrumbs', () => {
     const ui = await $.ui.mount({ plugin: 'breadcrumbs', surface: 'terminal', ...TESTS })
     expect(await ui.find({ key: 'test-1-row', text: /✓ 1 Test 1/ })).toBeDefined()
     expect(await ui.find({ key: 'test-2-row', text: /· 2 Test 2/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Waiting on you/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /waiting on you/ })).toBeUndefined()
   })
 
   test('tests come back on resume even when the breadcrumbs state survived', async ($, on) => {

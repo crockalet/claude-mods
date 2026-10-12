@@ -1,13 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
-import type { Ask, Crumbs, Entry, ManualTest, Note, Repo, TestRun, TestStatus, TestsView, View, Wait, Where } from '../types'
+import type { Answer, Ask, Crumbs, Entry, ManualTest, Note, Repo, TestRun, TestStatus, TestsView, View, Wait, Where } from '../types'
 import { contextMarkdown, repoState } from './markdown'
 import { normalize } from './state'
-import { ICON, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, settleNeeds, str, testOf, unmet } from './tests'
+import { ICON, LAUNCHER_ALIVE_MS, LAUNCH_DIR, LAUNCH_GRACE_MS, STATUSES, TESTER, TESTER_PROMPT, TESTS_GUIDANCE, TESTS_PANE, TOOL, WAIT_LIMIT_MS, isLive, listOf, openWait, pastables, settleNeeds, str, testOf, unmet } from './tests'
 import type { Saved } from './markdown'
 import { richLines, type Line } from './rich'
-import { ago, asks, basename, cdTarget, clip, day, doneOf, head, narrowTables, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
+import { MAX_ASKS, ago, asks, basename, cdTarget, clip, day, doneOf, head, narrowTables, openQuestions, parseObject, parseStatus, slug, stamp, strings, toolLabel } from './text'
 
 const PANE = 'breadcrumbs'
 const PAD = 1
@@ -47,23 +47,20 @@ const VIEW: View = {
   isShowingMore: false,
   isShowingStatus: false,
   openDone: null,
-  picked: {},
   typed: {},
-  details: {},
-  expanded: null,
 }
 const view = atom({ plugin: 'breadcrumbs', key: 'view' } as const, VIEW)
 const pending = atom({ plugin: 'breadcrumbs', key: 'pending' } as const, null)
 const testRun = atom({ plugin: 'breadcrumbs', key: 'tests' } as const, { brief: '', tests: [], waits: [], unreported: [] })
 const testsView = atom({ plugin: 'breadcrumbs', key: 'testsView' } as const, { expanded: null, typed: {} })
 
-const NOTE_GUIDANCE = [
-  'The user keeps a "breadcrumbs" pane open beside this session.',
-  `When the user asks for an explanation, a summary, a walkthrough or a comparison, write it with the ${SAVE_NOTE} tool`,
-  '(a short title and the full markdown body) instead of only in your reply, then reply with one line saying it is saved in the breadcrumbs pane.',
-  `To change a note you saved, call ${EDIT_NOTE} with its id and only the text that changes; never save the same note again.`,
-  'Keep doing any task the same message asked for. Do not save notes for status updates or for answers of a sentence or two.',
-  'The pane reflows notes to its current width, which the person resizes: headings, paragraphs, lists and tables all rewrap (table cells wrap), so write for reading, not for a column count. Only code and diagram lines are cut where the pane ends, so keep those short.',
+const COMPANION_GUIDANCE = [
+  'The user keeps a "breadcrumbs" pane open beside this session; it is how you reach them without stopping.',
+  'Write explanations, summaries and walkthroughs in your reply as usual: the pane files them as notes by itself.',
+  `Call ${SAVE_NOTE} only on purpose: to post something the user should see now while you keep working (a finding, a heads-up), a document they will come back to (a plan, a handoff, a decision record) that you keep current with ${EDIT_NOTE} (its id and only the text that changes), or when they ask you to save something. Never for status updates, and never to repeat what your reply says.`,
+  'When you cannot go on without an answer, use AskUserQuestion.',
+  'When you can go on with a sensible default, write the question on its own line as "Open question: <question> [option | option] (assuming <what you go with>)", the options optional, and keep working on that assumption.',
+  'The user answers in the pane when they get to it; the answer reaches you after one of your tool calls or with their next prompt, so adjust then if it changes anything, and do not ask it again meanwhile.',
 ].join(' ')
 
 type $ = EngineInterface
@@ -283,29 +280,28 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
   const request = [
     'You keep a running log of a coding session for a developer who switches between many sessions.',
     transcript
-      ? 'Read this transcript of the session so far and answer with one JSON object and nothing else. It is a catch-up: read "this turn" below as "the session so far", allow up to 6 decisions, attempts and done items, and take needsYou only from the last assistant message.'
+      ? 'Read this transcript of the session so far and answer with one JSON object and nothing else. It is a catch-up: read "this turn" below as "the session so far", and allow up to 6 decisions, attempts and done items.'
       : 'Read the latest exchange and answer with one JSON object and nothing else:',
-    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "needsYou": [{"question": string, "context": string, "options": [{"label": string, "description": string}]}], "done": {"title": string, "items": string[]} | null, "note": {"title": string, "markdown": string} | null}',
+    '{"task": string, "isNewTask": boolean, "decisions": string[], "attempts": [{"text": string, "isOk": boolean}], "done": {"title": string, "items": string[]} | null, "note": {"title": string, "markdown": string | null} | null}',
     '- task: the overall goal of the whole session in under 60 characters, imperative ("Fix websocket reconnect loop"), judged from all the recent prompts, not just this turn\'s step. Keep the current task\'s wording unless it is wrong or too narrow: when the prompts show the current task is one step of a bigger goal, widen it to that goal ("Verify the restart" becomes "Build the breadcrumbs mod").',
     '- isNewTask: true only when the user clearly moved on to a different goal, not a follow-up.',
     '- decisions: design or approach choices the assistant made on its own this turn where another option was reasonable and the user did not specify it ("Capped backoff at 30s instead of 60s"). Not actions taken, checks run or instructions given to the user. At most 3, under 90 characters each. Usually empty.',
     '- done: what this turn changed outside the conversation, from the assistant reply and tools used. Not reads, checks, explanations or plans; null when nothing changed. title: the turn\'s outcome in under 40 characters, past tense ("Added the secrets mod", "Pushed main"). items: the concrete results behind it, naming what changed ("Pushed main to crockalet/breadcrumbs", "Fixed reconnect race in socket.ts"), at most 3, under 90 characters each; empty when the title says it all.',
-    '- needsYou: what the assistant reply itself asks the user to answer or decide (never questions inferred from the earlier prompts or the task): explicit questions, approvals, choices between options. Each question is short, under 80 characters ("Approve the PR description?"). context: one or two sentences from the reply that someone needs to answer well (what is at stake, what each choice leads to). options: 2 to 4 when the question has discrete choices, each a short label ("Yes, I\'ll run it") and a one-line description of what that choice means, else []. Empty list when the reply asks nothing.',
     '- attempts: approaches tried this turn, isOk false when one failed or was abandoned (at most 3). Empty when none.',
-    '- note: only when the user asked for an explanation or summary, the reply contains it at a paragraph or more (not a one-line answer), and it was not saved already. markdown is that explanation, kept close to the reply\'s own words. Otherwise null.',
+    '- note: when the reply explains, summarizes, walks through or compares something at a paragraph or more (not a one-line answer, not a progress report), and it was not saved already. title: under 60 characters. markdown: null when the whole reply is the explanation, as it usually is; otherwise only the explanation, in the reply\'s own words. Otherwise note is null.',
     '',
     `Current task: ${state.tasks[0]?.title ?? '(none yet)'}`,
     `Earlier prompts, oldest first (context for the task only; already handled): ${state.prompts.slice(0, -1).map(p => JSON.stringify(clip(p.text, 200))).join(' | ') || 'none'}`,
-    `Already saved a note this turn: ${hasSavedNote}`,
+    `Claude posted a note itself this turn: ${hasSavedNote} (only skip the reply's explanation when that note already holds it)`,
     `Notes saved earlier (reuse a title exactly to update that note instead of adding one): ${state.notes.map(n => JSON.stringify(n.title)).join(', ') || 'none'}`,
     `Tools used this turn: ${tools.slice(0, 30).join('; ') || 'none'}`,
     '',
     ...(transcript
       ? ['<transcript>', transcript, '</transcript>']
-      : ['<user_prompt>', clip(prompt, 4000), '</user_prompt>', '<assistant_reply>', answer.slice(0, 12000), '</assistant_reply>']),
+      : ['<user_prompt>', clip(prompt, 4000), '</user_prompt>', '<assistant_reply>', answer.slice(0, 24000), '</assistant_reply>']),
   ].join('\n')
 
-  const reply = await $.model.complete({ model: cfg.model, prompt: request, maxTokens: 4000, effort: 'low', timeoutMs: 60_000 })
+  const reply = await $.model.complete({ model: cfg.model, prompt: request, maxTokens: 8000, effort: 'low', timeoutMs: 60_000 })
   if (!reply.isAnswered) {
     $.ui.log(`side pass skipped (${reply.reason})`)
     return
@@ -341,15 +337,17 @@ const sidePass = async ($: $, { answer, hasSavedNote, tools, transcript }: Turn)
       tasks,
       decided: [...c.decided, ...strings(out.decisions, cap, 90)].slice(-20),
       tried: [...c.tried, ...attempts].slice(-20),
-      // Haiku sometimes turns the user's own requests into questions; a reply that asks nothing has none.
-      needsYou: answer.includes('?') ? asks(out.needsYou) : [],
       done: done ? [...c.done, done].slice(-30) : c.done,
     }
   })
 
   const note = out.note as { title?: unknown; markdown?: unknown } | null
-  if (!hasSavedNote && note && typeof note.title === 'string' && typeof note.markdown === 'string' && note.markdown.trim()) {
-    await saveNote($, note.title, note.markdown)
+  // A catch-up's answer is only the last message, so it never files the whole of it.
+  const body = typeof note?.markdown === 'string' ? note.markdown : transcript ? '' : answer
+  const markdown = body.split('\n').filter(line => openQuestions(line).length === 0).join('\n')
+  // Claude's own saves are posts and documents, not this reply, so they don't stop it being filed; Haiku sees their titles.
+  if (note && typeof note.title === 'string' && markdown.trim()) {
+    await saveNote($, note.title, markdown)
   }
 }
 
@@ -477,7 +475,7 @@ const restoreFrom = async ($: $, from: string) => {
   const saved = await readSaved($, from)
   if (saved && current.tasks.length === 0 && current.notes.length === 0) {
     const { session: _s, worktree: _w, updatedAt: _u, transcript: _t, ...restored } = saved
-    await mutate($, () => ({ ...normalize(restored), activity: null, asking: null }))
+    await mutate($, () => ({ ...normalize(restored), activity: null, asking: null, isWorking: false }))
   }
   // Restored on its own: on a reload the breadcrumbs state can survive while the test list doesn't.
   const savedTests = await readTests($, from)
@@ -549,75 +547,60 @@ const backfill = async ($: $) => {
 const dropAsk = ($: $, question: string) =>
   mutate($, c => ({ ...c, needsYou: c.needsYou.filter(a => a.question !== question) }))
 
-const answerAsk = async ($: $, ask: Ask, option: string) => {
-  await dropAsk($, ask.question)
-  // Queued by the engine until the session is idle, so pressing mid-turn is safe.
-  await $.prompt.submit({ text: `Re: "${ask.question}" — ${option}`, asUser: true })
-}
-
 const setView = ($: $, fn: (v: View) => View) => update($, view, old => fn({ ...VIEW, ...old }))
 
-const answerOf = (v: View, question: string) => v.typed[question]?.trim() || v.picked[question] || ''
+// The source of truth for answers Claude hasn't read: a hook's state read can miss a write made while it runs.
+let outbox: Answer[] = []
 
-const withDetails = (v: View, question: string, answer: string) => {
-  const details = v.details[question]?.trim()
-  if (!details) return answer
-  return answer ? `${answer} (details: ${details})` : details
-}
-
-// With one question a choice is the whole answer; with several, choices collect until Send.
-const pickAsk = async ($: $, ask: Ask, option: string) => {
-  const { needsYou } = await readCrumbs($)
-  const v = { ...VIEW, ...(await read($, view)) }
-  // An open question is where details get added, so a choice there waits for Send.
-  if (needsYou.length <= 1 && v.expanded !== ask.question) return answerAsk($, ask, withDetails(v, ask.question, option))
-  await setView($, v => {
-    const picked = { ...v.picked }
-    if (picked[ask.question] === option) delete picked[ask.question]
-    else picked[ask.question] = option
-    return { ...v, picked }
+// Questions Claude can go on without wait in the pane; their answers queue rather than start a turn.
+const addAsks = ($: $, found: Ask[]) =>
+  mutate($, c => {
+    const fresh = found.filter(a => !c.asked.includes(a.question))
+    if (fresh.length === 0) return c
+    return { ...c, needsYou: [...c.needsYou, ...fresh].slice(-MAX_ASKS), asked: [...c.asked, ...fresh.map(a => a.question)].slice(-50) }
   })
+
+const answerAsk = async ($: $, ask: Ask, answer: string) => {
+  const text = answer.trim()
+  if (!text) return
+  outbox = [...outbox.filter(a => a.question !== ask.question), { question: ask.question, answer: text, at: await $.clock.now() }]
+  await mutate($, c => ({ ...c, outbox, needsYou: c.needsYou.filter(a => a.question !== ask.question) }))
+  await setView($, v => ({ ...v, typed: Object.fromEntries(Object.entries(v.typed).filter(([q]) => q !== ask.question)) }))
 }
 
 const typeAsk = ($: $, ask: Ask, text: string) =>
   setView($, v => ({ ...v, typed: { ...v.typed, [ask.question]: text } }))
 
-const submitTyped = async ($: $, ask: Ask, text: string) => {
-  const { needsYou } = await readCrumbs($)
-  const v = { ...VIEW, ...(await read($, view)) }
-  if (needsYou.length <= 1 && v.expanded !== ask.question && text.trim()) return answerAsk($, ask, withDetails(v, ask.question, text.trim()))
-  await typeAsk($, ask, text)
+const takeOutbox = async ($: $): Promise<string | null> => {
+  const taken = outbox
+  if (taken.length === 0) return null
+  outbox = []
+  await mutate($, c => ({ ...c, outbox }))
+  const [only] = taken
+
+  return taken.length === 1 && only
+    ? `The user answered your open question "${only.question}" in the breadcrumbs pane: ${only.answer}`
+    : ['The user answered your open questions in the breadcrumbs pane:', ...taken.map(a => `- "${a.question}" — ${a.answer}`)].join('\n')
 }
 
-const sendAnswers = async ($: $) => {
-  const { needsYou } = await readCrumbs($)
-  const v = { ...VIEW, ...(await read($, view)) }
-  const answered = needsYou
-    .map(a => ({ ask: a, answer: withDetails(v, a.question, answerOf(v, a.question)) }))
-    .filter(a => a.answer)
-  if (answered.length === 0) {
-    $.ui.toast('Pick or type an answer first')
-    return
-  }
-  const text =
-    answered.length === 1
-      ? `Re: "${answered[0]?.ask.question}" — ${answered[0]?.answer}`
-      : ['Answers:', ...answered.map(a => `- "${a.ask.question}" — ${a.answer}`)].join('\n')
-  const done = new Set(answered.map(a => a.ask.question))
-  await mutate($, c => ({ ...c, needsYou: c.needsYou.filter(a => !done.has(a.question)) }))
-  await setView($, old => ({ ...old, picked: {}, typed: {}, details: {}, expanded: null }))
-  await $.prompt.submit({ text, asUser: true })
+// Answers ride on the next tool result Claude reads, so they reach it mid-turn without a turn of their own.
+const withAnswers = async <R extends { deny?: string; context?: readonly string[] }>($: $, ran: R): Promise<R> => {
+  if (ran.deny !== undefined || outbox.length === 0) return ran
+  const text = await takeOutbox($)
+
+  return text ? ({ ...ran, context: [...(ran.context ?? []), text] } as R) : ran
 }
 
-const detailAsk = ($: $, ask: Ask, text: string) =>
-  setView($, v => ({ ...v, details: { ...v.details, [ask.question]: text } }))
-
-const toggleAsk = ($: $, ask: Ask) =>
-  setView($, v => ({ ...v, expanded: v.expanded === ask.question ? null : ask.question }))
-
+// A surface without an input box answers in the prompt instead, as a turn of its own.
 const draftAsk = async ($: $, ask: Ask) => {
   await $.prompt.fill({ text: `Re: "${ask.question}" — `, mode: 'insert' })
   $.ui.toast('Finish your answer in the prompt box')
+}
+
+// While Claude works the answers reach it after its next tool call; idle, this starts the turn.
+const sendNow = async ($: $) => {
+  const text = await takeOutbox($)
+  if (text) await $.prompt.submit({ text, asUser: true })
 }
 
 // A run saved before the brief existed has none.
@@ -658,6 +641,20 @@ const showWaiting = async ($: $) => {
   $.ui.status(open > 0 ? `⏳ ${open} test step${open > 1 ? 's' : ''} waiting on you` : undefined)
 }
 
+const STATUS_COLOR: Record<TestStatus, 'claude' | 'success' | 'error' | 'warning' | undefined> = {
+  todo: undefined,
+  running: 'claude',
+  passed: 'success',
+  failed: 'error',
+  blocked: 'warning',
+  retest: 'warning',
+}
+
+const copyText = async ($: $, text: string, surface: Parameters<$['ui']['copy']>[0]['surface']) => {
+  const copied = await $.ui.copy({ text, surface })
+  $.ui.toast(copied.isCopied ? `Copied ${clip(text, 40)}` : 'Could not copy here; select the text instead')
+}
+
 // A hook's own state reads don't see writes made while it runs, so a waiting step polls this instead.
 const answered = new Map<string, string>()
 
@@ -687,14 +684,38 @@ const replyTest = async ($: $, t: ManualTest, typed: string) => {
   await routeTest($, t, message, `[manual test ${t.id} · ${t.title}] ${message}`)
 }
 
+// Testers the person stopped: every later tool call is refused but a cleanup kill and the hand-back that reports and ends the run.
+const stopped = new Map<string, string>()
+
+const isWrapUp = (e: Record<string, unknown>) =>
+  e.tool === 'SubagentHandback' || e.tool === 'TaskStop' || e.tool === 'KillShell' || (e.tool === 'Bash' && /^\s*p?kill\b/.test(str(e.command)))
+
+const stopDeny = (e: Record<string, unknown> & { agentId?: string }) =>
+  e.agentId !== undefined && stopped.has(e.agentId) && !isWrapUp(e) ? { deny: stopped.get(e.agentId) ?? '' } : null
+
+const stopTester = async ($: $, t: ManualTest, verdict: 'passed' | 'failed' | null, why: string) => {
+  if (!t.agentId) return
+  const said = verdict ? `The person marked this test ${verdict}${why ? `: ${why}` : ''}.` : 'The person stopped this test.'
+  const note = `${said} Run no more steps and do not change its status: kill the background processes you started, then end your turn now with one line on what you saw before the stop.`
+  await patchTest($, t.id, old => ({ ...old, status: verdict ?? 'todo', asking: null, ...(t.asking ? { agentId: null } : {}) }))
+  await logTest($, t.id, 'you', verdict ? `${ICON[verdict]} ${verdict}${why ? `: ${why}` : ''}` : '■ stopped the tester')
+  // A tester paused on the planner has ended its turn; a message would only wake it.
+  if (t.asking) return
+  stopped.set(t.agentId, note)
+  const wait = openWait(await readRun($), t.id)
+  if (wait) await answerWait($, wait.id, note)
+  else await $.session.send({ to: { agentId: t.agentId }, text: note })
+}
+
 const markTest = async ($: $, t: ManualTest, status: 'passed' | 'failed', typed: string) => {
   const why = typed.trim()
+  await setTestsView($, v => ({ ...v, typed: { ...v.typed, [t.id]: '' } }))
+  if (isLive(t)) return stopTester($, t, status, why)
   await patchTest($, t.id, old => ({ ...old, status }))
   await logTest($, t.id, 'you', `${status === 'passed' ? '✓ passed' : '✗ failed'}${why ? `: ${why}` : ''}`)
-  await setTestsView($, v => ({ ...v, typed: { ...v.typed, [t.id]: '' } }))
   const line = `${ICON[status]} test ${t.id} ${t.title}${why ? `: ${why}` : ''}`
   const r = await readRun($)
-  if (openWait(r, t.id) || isLive(t)) {
+  if (openWait(r, t.id)) {
     await routeTest($, t, `The person marked this test ${status}${why ? `: ${why}` : ''}. Wrap up.`, line)
     return
   }
@@ -716,23 +737,51 @@ const startTester = async ($: $, t: ManualTest) => {
     t.trigger ? `Trigger: ${t.trigger}` : '',
     (t.assumes ?? []).length > 0 ? `Assumes:\n${(t.assumes ?? []).map(a => `- ${a}`).join('\n')}` : '',
     t.watch ? `Follow along with: ${t.watch}` : '',
-    t.log.length > 0 ? `Earlier on this test:\n${t.log.map(l => `- ${l.from}: ${l.text}`).join('\n')}` : '',
+    // Framed as past runs: a restarted tester once read an earlier "■ stopped" line as its own stop and quit at once.
+    t.log.length > 0
+      ? `Earlier runs of this test (history only; this is a fresh run, so start the steps):\n${t.log.map(l => `- ${l.from}: ${l.text}`).join('\n')}`
+      : '',
   ]
     .filter(Boolean)
     .join('\n\n')
-  // Plugin hooks don't run inside an agent a plugin spawns, so the tester's own tool calls would go unanswered; the main agent spawns it instead.
+  const description = clip(`Test ${t.id}: ${t.title}`, 40)
   await patchTest($, t.id, old => ({ ...old, status: 'running', agentId: null }))
   await setTestsView($, v => ({ ...v, expanded: t.id }))
-  await $.prompt.submit({
+  // An agent this plugin spawned would skip all of its hooks, leaving the tester's tools unanswered; the launcher mod's spawn doesn't.
+  if (await hasLauncher($)) {
+    const request = `${await launchDir($)}/${await $.clock.now()}-${slug(t.id, 12)}.json`
+    await $.fs.write(request, JSON.stringify({ subagentType: TESTER, description, prompt }))
+    $.clock.after(LAUNCH_GRACE_MS, async () => {
+      if (!(await $.fs.exists(request))) return
+      await $.process.run(['rm', '-f', request])
+      await askMainToStart($, t, description, prompt)
+    })
+    return
+  }
+  await askMainToStart($, t, description, prompt)
+}
+
+const askMainToStart = ($: $, t: ManualTest, description: string, prompt: string) =>
+  $.prompt.submit({
     text: [
-      `Start the tester for manual test ${t.id}: call the Agent tool with subagent_type "${TESTER}", run_in_background true, description "${clip(`Test ${t.id}: ${t.title}`, 40)}" and exactly this prompt. Then end your turn without walking the user through the test yourself.`,
+      `Start the tester for manual test ${t.id}: call the Agent tool with subagent_type "${TESTER}", run_in_background true, description "${description}" and exactly this prompt. Then end your turn without walking the user through the test yourself.`,
       '',
       prompt,
     ].join('\n'),
   })
+
+const launchDir = async ($: $) => `${await notesRoot($)}/${LAUNCH_DIR}/${sessionId}`
+
+// The launcher stamps `ready` while it runs, so a stale stamp means it was removed or stopped.
+const hasLauncher = async ($: $) => {
+  try {
+    return (await $.clock.now()) - Number(await $.fs.read(`${await launchDir($)}/ready`)) < LAUNCHER_ALIVE_MS
+  } catch {
+    return false
+  }
 }
 
-// Links a tester the main agent spawned to its test, by the "Test <id>:" line its prompt opens with.
+// Links a tester the launcher or the main agent spawned to its test, by the "Test <id>:" line its prompt opens with.
 const bindTester = async ($: $, prompt: string, agentId: string) => {
   const id = /^Test (\S+):/.exec(prompt.trim())?.[1]
   if (!id) return
@@ -741,20 +790,37 @@ const bindTester = async ($: $, prompt: string, agentId: string) => {
 
 const planTests = async ($: $, e: Record<string, unknown>) => {
   const raw = Array.isArray(e.tests) ? (e.tests as Record<string, unknown>[]) : []
-  const isAppending = e.mode === 'append'
+  // Tests arrive a few at a time as pieces get ready, so a call adds to the list unless it asks to start over.
+  const isAppending = e.mode !== 'replace'
   const r = await readRun($)
   const kept = isAppending ? r.tests : []
-  const incoming: ManualTest[] = raw
-    .filter(t => str(t?.title))
+  const given = raw.filter(t => str(t?.title))
+  // A later batch often numbers its tests from 1 again; those get the next free ids, and its needs follow them.
+  const taken = new Set(kept.map(t => t.id))
+  const renamed = new Map<string, string>()
+  let next = kept.reduce((n, t) => Math.max(n, Number(t.id) || 0), kept.length)
+  const assigned = given.map(t => {
+    const id = str(t.id)
+    if (id && !taken.has(id)) {
+      taken.add(id)
+      renamed.set(id, id)
+      return id
+    }
+    while (taken.has(String(++next)));
+    taken.add(String(next))
+    if (id && !renamed.has(id)) renamed.set(id, String(next))
+    return String(next)
+  })
+  const incoming: ManualTest[] = given
     .map((t, i) => ({
-      id: str(t.id) || String(kept.length + i + 1),
+      id: assigned[i] ?? String(i + 1),
       title: clip(str(t.title), 60),
       steps: listOf(t.steps),
       expect: str(t.expect),
       watch: str(t.watch),
       trigger: str(t.trigger),
       assumes: listOf(t.assumes),
-      needs: listOf(t.needs),
+      needs: listOf(t.needs).map(id => renamed.get(id) ?? id),
       ...(str(t.model) ? { model: str(t.model) } : {}),
       status: 'todo',
       agentId: null,
@@ -777,9 +843,13 @@ const planTests = async ($: $, e: Record<string, unknown>) => {
     unreported: isAppending ? old.unreported : [],
   }))
   void $.ui.open({ id: TESTS_PANE, title: 'tests' })
+  $.ui.toast(`${incoming.length} manual test${incoming.length > 1 ? 's' : ''} ready in /tests`)
 
   return {
-    result: `Listed ${incoming.length} test(s) in the tests pane (/tests). The user starts each one there; a tester subagent guides them and its final report reaches you when it finishes. Tell the user in one line that the tests are in the pane.`,
+    result: [
+      `Added ${incoming.length} test(s) to the tests pane (/tests): ${incoming.map(t => `${t.id} ${t.title}`).join('; ')}.`,
+      'Use these ids with test_update. The user runs them when they get to them, each with a tester subagent whose final report reaches you; carry on with your work meanwhile.',
+    ].join(' '),
   }
 }
 
@@ -824,7 +894,8 @@ const updateTest = async ($: $, e: Record<string, unknown> & { agentId?: string 
 
 const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }, signal: AbortSignal) => {
   const instruction = str(e.instruction)
-  const steps = listOf(e.steps).map(s => clip(s, 120))
+  // Not clipped: the pane wraps steps, and a cut command can't be pasted.
+  const steps = listOf(e.steps)
   if (!instruction && steps.length === 0) return { deny: 'await_user needs an instruction or steps.' }
   const t = testOf(await readRun($), e)
   const now = await $.clock.now()
@@ -832,7 +903,7 @@ const awaitUser = async ($: $, e: Record<string, unknown> & { agentId?: string }
     id: `${now}-${Math.random().toString(36).slice(2, 7)}`,
     testId: t?.id ?? null,
     step: typeof e.step === 'number' ? e.step : null,
-    instruction: clip(instruction, 200),
+    instruction,
     steps,
     options: listOf(e.options).slice(0, 4).map(o => clip(o, 30)),
     at: now,
@@ -877,6 +948,7 @@ const askPlanner = async ($: $, e: Record<string, unknown> & { agentId?: string 
 }
 
 const testerDone = async ($: $, agentId: string, answer: string, isAborted: boolean) => {
+  stopped.delete(agentId)
   const t = (await readRun($)).tests.find(x => x.agentId === agentId)
   if (!t) return
   // Stopped to ask the planner: still this test's tester, resumed by the reply.
@@ -910,7 +982,7 @@ const briefInput = (tool: string, input: unknown): Record<string, string> | null
   }
   if (tool === TOOL('test_plan')) {
     const n = Array.isArray(i.tests) ? i.tests.length : 0
-    return { tests: `${n} test${n === 1 ? '' : 's'}`, ...(i.mode === 'append' ? { mode: 'append' } : {}) }
+    return { tests: `${n} test${n === 1 ? '' : 's'}`, ...(i.mode === 'replace' ? { mode: 'replace' } : {}) }
   }
   if (tool === TOOL('test_update')) {
     const text = str(i.reply) || str(i.note)
@@ -960,6 +1032,8 @@ export const register: Register = (on, options) => {
     const known = await $.store.get(`dir:${sessionId}`)
     dir = typeof known === 'string' ? known : null
     if (dir) await restoreFrom($, dir)
+    // A reload restarts the module but not the session's state, so answers still waiting come back from it.
+    outbox = (await readCrumbs($)).outbox
 
     await $.command.register({
       name: 'whereami',
@@ -968,12 +1042,12 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'save_note',
       description:
-        'Save an explanation, summary or walkthrough the user asked for as a markdown note in their breadcrumbs pane, so it does not get buried in the transcript. The pane reflows the note to its width, tables included.',
+        'Post a markdown note to the user\'s breadcrumbs pane: something they should see now while you keep working, or a document they will come back to (a plan, a handoff, a decision record). Explanations in your reply are filed as notes without it. The pane reflows notes to its width, tables included; only code and diagram lines are cut, so keep those short.',
       inputSchema: {
         type: 'object',
         properties: {
           title: { type: 'string', description: 'A short title, under 60 characters' },
-          markdown: { type: 'string', description: 'The full explanation in markdown' },
+          markdown: { type: 'string', description: 'The note in markdown' },
         },
         required: ['title', 'markdown'],
       },
@@ -1015,7 +1089,7 @@ export const register: Register = (on, options) => {
     }
     await $.tool.register({
       name: 'test_plan',
-      description: 'List manual or end-to-end tests the user has to run by hand in their tests pane, each with its steps. The user starts each test from the pane.',
+      description: 'Add manual or end-to-end tests the user has to run by hand to their tests pane, each with its steps, as soon as the change they cover is ready to try. The user starts each test from the pane whenever they get to it.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1030,7 +1104,7 @@ export const register: Register = (on, options) => {
               properties: {
                 id: { type: 'string', description: 'Short id, e.g. "1"; defaults to its position' },
                 title: { type: 'string', description: 'Under 40 characters' },
-                steps: { type: 'array', items: { type: 'string' }, description: 'What the person does, each under 70 characters' },
+                steps: { type: 'array', items: { type: 'string' }, description: 'What the person does, each short; a command or text to paste goes whole in backticks' },
                 expect: { type: 'string', description: 'What should happen' },
                 watch: { type: 'string', description: 'Logs or watchers to follow along with' },
                 trigger: {
@@ -1044,7 +1118,7 @@ export const register: Register = (on, options) => {
               required: ['title'],
             },
           },
-          mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) starts a new list' },
+          mode: { type: 'string', enum: ['append', 'replace'], description: 'append (default) adds to the tests already listed; replace starts a new list' },
         },
         required: ['tests'],
       },
@@ -1079,8 +1153,8 @@ export const register: Register = (on, options) => {
         properties: {
           id: { type: 'string', description: 'The test id; a tester may leave it out' },
           step: { type: 'number', description: 'The number of the first step shown' },
-          steps: { type: 'array', items: { type: 'string' }, description: 'Steps to do in a row before answering, each under 100 characters' },
-          instruction: { type: 'string', description: 'A single step, or the question to answer after the steps; under 100 characters' },
+          steps: { type: 'array', items: { type: 'string' }, description: 'Steps to do in a row before answering, each short; a command or text to paste goes whole in backticks and gets a copy button' },
+          instruction: { type: 'string', description: 'A single step, or the question to answer after the steps; short' },
           options: { type: 'array', items: { type: 'string' }, description: '2 to 4 short answers to the question; they replace Done and Can\'t' },
         },
       },
@@ -1135,7 +1209,7 @@ export const register: Register = (on, options) => {
     return {
       sections: [
         ...composed.sections,
-        { id: 'breadcrumbs:notes', text: NOTE_GUIDANCE, scope: 'session' },
+        { id: 'breadcrumbs:companion', text: COMPANION_GUIDANCE, scope: 'session' },
         { id: 'breadcrumbs:tests', text: TESTS_GUIDANCE, scope: 'session' },
       ],
     }
@@ -1143,26 +1217,26 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     const isPerson = e.origin.kind === 'composer' || (e.origin.kind === 'plugin' && e.origin.name === 'breadcrumbs')
-    if (isPerson && e.text.trim() && !e.text.trimStart().startsWith('/')) {
+    const isCommand = e.text.trimStart().startsWith('/')
+    if (isPerson && e.text.trim() && !isCommand) {
       const now = await $.clock.now()
-      // A new prompt usually answers what was pending; the next side pass re-asks anything still open.
-      await mutate($, c => ({ ...c, needsYou: [], prompts: [...c.prompts, { text: e.text.trim(), at: now }].slice(-5) }))
-      await setView($, v => ({ ...v, picked: {}, typed: {}, details: {}, expanded: null }))
+      await mutate($, c => ({ ...c, prompts: [...c.prompts, { text: e.text.trim(), at: now }].slice(-5) }))
       if (e.turnId === undefined) {
         turnTools = []
         hasSavedNote = false
       }
     }
-    const passes = await takePasses($)
+    const extra = [await takePasses($), isCommand ? null : await takeOutbox($)].filter((x): x is string => x !== null)
 
-    return next(passes ? { ...e, context: [...(e.context ?? []), passes] } : e)
+    return next(extra.length > 0 ? { ...e, context: [...(e.context ?? []), ...extra] } : e)
   })
 
   // A subagent's call to a plugin tool is answered only by a hook matched on that tool.
   for (const tool of TEST_TOOLS) {
     on('tool.call', { tool: tool as typeof SAVE_NOTE }, async ($, e, next) => {
       try {
-        return await testTool($, e as Record<string, unknown> & { tool: unknown; agentId?: string }, next.signal)
+        const call = e as Record<string, unknown> & { tool: unknown; agentId?: string }
+        return stopDeny(call) ?? (await testTool($, call, next.signal))
       } catch (error) {
         return { deny: `breadcrumbs: ${error instanceof Error ? error.message : String(error)}` }
       }
@@ -1177,7 +1251,7 @@ export const register: Register = (on, options) => {
     const note = await saveNote($, title, markdown)
 
     return {
-      result: `Saved "${note.title}" to the breadcrumbs pane (${note.file}). Its id is ${note.id}; change it later with edit_note. Tell the user in one line where to find it.`,
+      result: `Saved "${note.title}" to the breadcrumbs pane (${note.file}). Its id is ${note.id}; keep it current with edit_note.`,
     }
   })
 
@@ -1192,10 +1266,19 @@ export const register: Register = (on, options) => {
     if ('error' in edited) return { deny: edited.error }
     hasSavedNote = true
 
-    return { result: `Updated "${edited.note.title}" in the breadcrumbs pane. Tell the user in one line that it changed.` }
+    return { result: `Updated "${edited.note.title}" in the breadcrumbs pane.` }
   })
 
   on('tool.call', async ($, e, next) => {
+    const refused = stopDeny(e as Record<string, unknown> & { agentId?: string })
+    if (refused) return refused
+    // The hand-back ends a tester's run: settle its test now, so a stop pressed in the gap before its turn completes can't wake it again.
+    const agentId = e.agentId
+    if (agentId !== undefined && String(e.tool) === 'SubagentHandback') {
+      const ran = await next(e)
+      if (ran.deny === undefined && ran.isError !== true) await testerDone($, agentId, str((e as Record<string, unknown>).message), false)
+      return ran
+    }
     if (e.agentId !== undefined || OWN_TOOLS.includes(String(e.tool))) return next(e)
     const label = toolLabel(String(e.tool), e as Record<string, unknown>)
     turnTools.push(label)
@@ -1203,15 +1286,30 @@ export const register: Register = (on, options) => {
       await mutate($, c => ({ ...c, activity: label }))
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) await track($, e as Record<string, unknown>)
-      return ran
+      return withAnswers($, ran)
     }
     const question = e.questions[0]?.question ?? 'A question for you'
     await mutate($, c => ({ ...c, activity: 'Waiting on you', asking: clip(question, 120) }))
     try {
-      return await next(e)
+      return withAnswers($, await next(e))
     } finally {
       await mutate($, c => ({ ...c, activity: null, asking: null }))
     }
+  })
+
+  on('turn.start', async ($, e, next) => {
+    await mutate($, c => ({ ...c, isWorking: true }))
+    return next(e)
+  })
+
+  // Each response is read as it lands, so a question asked mid-turn shows while Claude keeps working.
+  on('turn.step', async function* ($, e, next) {
+    const step = yield* next(e)
+    if (e.agentId === undefined) {
+      const found = openQuestions(step.answer)
+      if (found.length > 0) await addAsks($, found)
+    }
+    return step
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -1227,6 +1325,7 @@ export const register: Register = (on, options) => {
     await mutate($, c => ({
       ...c,
       activity: null,
+      isWorking: false,
       lastSaid: answer ? { text: head(answer, 600), at: now } : c.lastSaid,
     }))
     if (answer && !e.isAborted) {
@@ -1288,9 +1387,6 @@ export const register: Register = (on, options) => {
     const set = (patch: Partial<View>) => () => setView($, old => ({ ...old, ...patch }))
     const elements = $.ui.resolve(e)
     const Input = 'Input' in elements ? elements.Input : undefined
-    const isMany = c.needsYou.length > 1
-    const answeredCount = c.needsYou.filter(a => withDetails(v, a.question, answerOf(v, a.question))).length
-    const hasSend = isMany || c.needsYou.some(a => a.question === v.expanded)
 
     const task = c.tasks[0]
     const prompt = c.prompts.at(-1)
@@ -1330,7 +1426,7 @@ export const register: Register = (on, options) => {
           )}
         </Box>
 
-        {(c.asking || c.needsYou.length > 0) && (
+        {(c.asking || c.needsYou.length > 0 || c.outbox.length > 0) && (
           <Box flexDirection="column">
             <Text color="warning">Needs you</Text>
             {c.asking && (
@@ -1342,90 +1438,56 @@ export const register: Register = (on, options) => {
                 <Text dimColor>{'  answer in the dialog below'}</Text>
               </Box>
             )}
-            {c.needsYou.map((ask, i) => {
-              const isOpen = v.expanded === ask.question
-              const optionButton = (option: string, j: number, max: number) => {
-                const isPicked = v.picked[ask.question] === option
-                return (
-                  <Button
-                    key={`ask-${i}-opt-${j}`}
-                    label={`${isPicked ? '✓ ' : ''}${clip(option, max)}`}
-                    variant={isPicked ? 'primary' : undefined}
-                    onPress={() => pickAsk($, ask, option)}
-                  />
-                )
-              }
-              return (
-                <Box key={`ask-${i}`} flexDirection="column">
-                  <Box>
-                    <Text color="warning">{isOpen ? '▾ ' : '◆ '}</Text>
-                    <Text bold={isOpen}>{ask.question}</Text>
-                  </Box>
-                  {isOpen && ask.context && (
-                    <Box marginLeft={2}>
-                      <Text dimColor>{ask.context}</Text>
-                    </Box>
-                  )}
-                  {isOpen ? (
-                    <Box marginLeft={2} flexDirection="column">
-                      {ask.options.map((option, j) => (
-                        <Box key={`ask-${i}-row-${j}`} flexDirection="column">
-                          {optionButton(option, j, 80)}
-                          {ask.optionNotes[j] && (
-                            <Box marginLeft={2}>
-                              <Text dimColor>{ask.optionNotes[j]}</Text>
-                            </Box>
-                          )}
-                        </Box>
-                      ))}
-                    </Box>
-                  ) : (
-                    ask.options.length > 0 && (
-                      <Box marginLeft={2} columnGap={1} flexWrap="wrap">
-                        {ask.options.map((option, j) => optionButton(option, j, 28))}
-                      </Box>
-                    )
-                  )}
-                  {Input && (
-                    <Box marginLeft={2}>
-                      <Input
-                        key={`ask-${i}-input`}
-                        placeholder={ask.options.length > 0 ? 'or type an answer…' : 'type an answer…'}
-                        value={v.typed[ask.question] ?? ''}
-                        submitLabel={hasSend ? undefined : 'send'}
-                        onInput={text => typeAsk($, ask, text)}
-                        onSubmit={text => submitTyped($, ask, text)}
-                      />
-                    </Box>
-                  )}
-                  {isOpen && Input && (
-                    <Box marginLeft={2}>
-                      <Input
-                        key={`ask-${i}-details`}
-                        placeholder="extra details (optional)…"
-                        value={v.details[ask.question] ?? ''}
-                        onInput={text => detailAsk($, ask, text)}
-                        onSubmit={text => detailAsk($, ask, text)}
-                      />
-                    </Box>
-                  )}
-                  <Box marginLeft={2} columnGap={2}>
-                    <Button key={`ask-${i}-more`} plain dimColor label={isOpen ? 'less' : 'details'} onPress={() => toggleAsk($, ask)} />
-                    {!Input && <Button key={`ask-${i}-reply`} plain dimColor label="reply…" onPress={() => draftAsk($, ask)} />}
-                    <Button key={`ask-${i}-dismiss`} plain dimColor label="dismiss" onPress={() => dropAsk($, ask.question)} />
-                  </Box>
+            {c.needsYou.map((ask, i) => (
+              <Box key={`ask-${i}`} flexDirection="column">
+                <Box>
+                  <Text color="warning">{'◆ '}</Text>
+                  <Text bold>{ask.question}</Text>
                 </Box>
-              )
-            })}
-            {hasSend && (
-              <Box marginTop={1}>
-                <Button
-                  key="send-answers"
-                  variant="primary"
-                  dimColor={answeredCount === 0}
-                  label={answeredCount > 0 ? `Send ${answeredCount} answer${answeredCount > 1 ? 's' : ''}` : 'Send answers'}
-                  onPress={() => sendAnswers($)}
-                />
+                {(ask.assumption || ask.context) && (
+                  <Box marginLeft={2}>
+                    <Text dimColor>{ask.assumption ? `going with ${ask.assumption}` : ask.context}</Text>
+                  </Box>
+                )}
+                {ask.options.length > 0 && (
+                  <Box marginLeft={2} columnGap={1} flexWrap="wrap">
+                    {ask.options.map((option, j) => (
+                      <Button key={`ask-${i}-opt-${j}`} label={clip(option, 28)} onPress={() => answerAsk($, ask, option)} />
+                    ))}
+                  </Box>
+                )}
+                {Input && (
+                  <Box marginLeft={2}>
+                    <Input
+                      key={`ask-${i}-input`}
+                      placeholder={ask.options.length > 0 ? 'or type an answer…' : 'type an answer…'}
+                      value={v.typed[ask.question] ?? ''}
+                      submitLabel="send"
+                      onInput={text => typeAsk($, ask, text)}
+                      onSubmit={text => answerAsk($, ask, text)}
+                    />
+                  </Box>
+                )}
+                <Box marginLeft={2} columnGap={2}>
+                  {!Input && <Button key={`ask-${i}-reply`} plain dimColor label="reply…" onPress={() => draftAsk($, ask)} />}
+                  <Button key={`ask-${i}-dismiss`} plain dimColor label={ask.assumption ? 'fine as is' : 'dismiss'} onPress={() => dropAsk($, ask.question)} />
+                </Box>
+              </Box>
+            ))}
+            {c.outbox.length > 0 && (
+              <Box flexDirection="column">
+                {c.outbox.map((a, i) => (
+                  <Box key={`sent-${i}`}>
+                    <Text color="success">{'✓ '}</Text>
+                    <Text dimColor wrap="truncate-end">
+                      {clip(a.question, Math.max(12, Math.floor(width / 2)))} — {a.answer}
+                    </Text>
+                  </Box>
+                ))}
+                <Box columnGap={2}>
+                  <Text dimColor>{c.isWorking ? '  Claude reads this after its next step' : '  Claude reads this with your next prompt'}</Text>
+                  {!c.isWorking && <Button key="send-now" plain label="send now" onPress={() => sendNow($)} />}
+                </Box>
               </Box>
             )}
           </Box>
@@ -1640,104 +1702,152 @@ export const register: Register = (on, options) => {
     const failed = r.tests.filter(t => t.status === 'failed').length
     const typed = (id: string) => v.typed[id] ?? ''
     const type = (id: string) => (value: string) => setTestsView($, old => ({ ...old, typed: { ...old.typed, [id]: value } }))
+    const copies = (key: string, text: string) => {
+      const found = pastables(text)
+      if (found.length === 0) return null
+      return (
+        <Box key={`${key}-copies`} marginLeft={3} columnGap={1} flexWrap="wrap">
+          {found.map((p, k) => (
+            <Button
+              key={`${key}-copy-${k}`}
+              plain
+              dimColor
+              label={found.length === 1 ? '⧉ copy' : `⧉ ${clip(p, 24)}`}
+              onPress={press => copyText($, p, press.surface)}
+            />
+          ))}
+        </Box>
+      )
+    }
+
+    const waitCard = (w: Wait) => {
+      const key = `wait-${w.id}`
+      return (
+        <Box key={key} marginLeft={2} flexDirection="column">
+          <Text color="warning">{`◆ waiting on you${w.step !== null ? ` · step ${w.step}` : ''}`}</Text>
+          {(w.steps ?? []).map((s, i) => (
+            <Box key={`${key}-step-${i}`} flexDirection="column">
+              <Box>
+                <Text dimColor>{`${(w.step ?? 1) + i}. `}</Text>
+                <Text>{s}</Text>
+              </Box>
+              {copies(`${key}-step-${i}`, s)}
+            </Box>
+          ))}
+          {w.instruction && <Text bold={(w.steps ?? []).length > 0}>{w.instruction}</Text>}
+          {w.instruction && copies(`${key}-instruction`, w.instruction)}
+          <Box columnGap={1} flexWrap="wrap">
+            {(w.options ?? []).length > 0 ? (
+              (w.options ?? []).map((o, j) => (
+                <Button key={`${key}-opt-${j}`} label={o} onPress={() => answerWait($, w.id, typed(key).trim() ? `${o}. ${typed(key).trim()}` : o)} />
+              ))
+            ) : (
+              [
+                <Button key={`${key}-done`} variant="primary" label="Done" onPress={() => answerWait($, w.id, typed(key).trim() ? `Done. ${typed(key).trim()}` : 'Done.')} />,
+                <Button key={`${key}-cant`} label="Can't" onPress={() => answerWait($, w.id, `Can't do this step.${typed(key).trim() ? ` ${typed(key).trim()}` : ''}`)} />,
+              ]
+            )}
+          </Box>
+          {Input && (
+            <Input
+              key={`${key}-input`}
+              placeholder="reply…"
+              value={typed(key)}
+              submitLabel="send"
+              onInput={type(key)}
+              onSubmit={value => (value.trim() ? answerWait($, w.id, value.trim()) : undefined)}
+            />
+          )}
+        </Box>
+      )
+    }
 
     if (r.tests.length === 0 && waits.length === 0) {
       return (
         <Box flexDirection="column" paddingX={PAD} paddingY={1}>
           <Text dimColor>No manual tests yet.</Text>
-          <Text dimColor>Ask Claude for a manual test planTests and it lists the tests here.</Text>
+          <Text dimColor>Ask Claude for a manual test plan and it lists the tests here.</Text>
         </Box>
       )
     }
 
+    // A wait whose test is gone has no row to sit under.
+    const orphans = waits.filter(w => !r.tests.some(t => t.id === w.testId))
+    const ordered = [...r.tests.filter(t => t.status === 'running'), ...r.tests.filter(t => t.status !== 'running')]
+
     return (
       <Box flexDirection="column" gap={1} paddingX={PAD} paddingY={1}>
-        <Text dimColor>
-          {r.tests.length} tests · {passed} passed{failed > 0 ? ` · ${failed} failed` : ''}
-        </Text>
+        <Box columnGap={2}>
+          <Text dimColor>
+            {r.tests.length} tests · {passed} passed{failed > 0 ? ` · ${failed} failed` : ''}
+          </Text>
+          {waits.length > 0 && <Text color="warning">⏳ {waits.length} waiting on you</Text>}
+        </Box>
 
-        {waits.length > 0 && (
-          <Box flexDirection="column">
-            <Text color="warning">Waiting on you · {waits.length}</Text>
-            {waits.map(w => {
-              const t = r.tests.find(x => x.id === w.testId)
-              const key = `wait-${w.id}`
-              return (
-                <Box key={key} flexDirection="column">
-                  <Box>
-                    <Text color="warning">{'◆ '}</Text>
-                    <Text bold wrap="truncate-end">
-                      {t ? `${t.id} ${t.title}` : 'Step'}
-                      {w.step !== null ? ` · step ${w.step}` : ''}
-                    </Text>
-                  </Box>
-                  <Box marginLeft={2} flexDirection="column">
-                    {(w.steps ?? []).map((s, i) => (
-                      <Box key={`${key}-step-${i}`}>
-                        <Text dimColor>{`${(w.step ?? 1) + i}. `}</Text>
-                        <Text>{s}</Text>
-                      </Box>
-                    ))}
-                    {w.instruction && <Text bold={(w.steps ?? []).length > 0}>{w.instruction}</Text>}
-                    <Box columnGap={1} flexWrap="wrap">
-                      {(w.options ?? []).length > 0 ? (
-                        (w.options ?? []).map((o, j) => (
-                          <Button key={`${key}-opt-${j}`} label={o} onPress={() => answerWait($, w.id, typed(key).trim() ? `${o}. ${typed(key).trim()}` : o)} />
-                        ))
-                      ) : (
-                        [
-                          <Button key={`${key}-done`} variant="primary" label="Done" onPress={() => answerWait($, w.id, typed(key).trim() ? `Done. ${typed(key).trim()}` : 'Done.')} />,
-                          <Button key={`${key}-cant`} label="Can't" onPress={() => answerWait($, w.id, `Can't do this step.${typed(key).trim() ? ` ${typed(key).trim()}` : ''}`)} />,
-                        ]
-                      )}
-                    </Box>
-                    {Input && (
-                      <Input
-                        key={`${key}-input`}
-                        placeholder="reply…"
-                        value={typed(key)}
-                        submitLabel="send"
-                        onInput={type(key)}
-                        onSubmit={value => (value.trim() ? answerWait($, w.id, value.trim()) : undefined)}
-                      />
-                    )}
-                  </Box>
-                </Box>
-              )
-            })}
-          </Box>
-        )}
+        {orphans.map(waitCard)}
 
-        <Box flexDirection="column">
-          {r.tests.map(t => {
+        <Box flexDirection="column" gap={1}>
+          {ordered.map(t => {
             const isOpen = v.expanded === t.id
             const wait = openWait(r, t.id)
             const waiting = unmet(r, t)
+            const isRunning = t.status === 'running'
+            const canStart = !isRunning && waiting.length === 0
+            const stop = isLive(t) && (
+              <Button key={`test-${t.id}-stop`} plain label="■ stop" onPress={() => stopTester($, t, null, '')} />
+            )
+            const status = wait ? (
+              <Box columnGap={1}>
+                <Text color="warning">{wait.step !== null ? `⏳ step ${wait.step}` : '⏳'}</Text>
+                {stop}
+              </Box>
+            ) : t.asking ? (
+              <Box columnGap={1}>
+                <Text color="claude">asking Claude</Text>
+                {stop}
+              </Box>
+            ) : isRunning ? (
+              <Box columnGap={1}>
+                <Text color="claude">running</Text>
+                {stop}
+              </Box>
+            ) : canStart ? (
+              <Button key={`test-${t.id}-start`} plain label={t.log.length > 0 ? '▶ restart' : '▶ start'} onPress={() => startTester($, t)} />
+            ) : (
+              t.status === 'todo' && <Text dimColor>after {waiting.join(', ')}</Text>
+            )
             return (
-              <Box key={`test-${t.id}`} flexDirection="column">
-                <Box justifyContent="space-between">
-                  <Button
-                    key={`test-${t.id}-row`}
-                    plain
-                    label={`${isOpen ? '▾' : '▸'} ${ICON[t.status]} ${t.id} ${clip(t.title, width - 14)}`}
-                    onPress={() => setTestsView($, old => ({ ...old, expanded: isOpen ? null : t.id }))}
-                  />
-                  {wait ? (
-                    <Text color="warning">{wait.step !== null ? `⏳ ${wait.step}` : '⏳'}</Text>
-                  ) : t.asking ? (
-                    <Text color="claude">asking Claude</Text>
-                  ) : (
-                    t.status === 'todo' && waiting.length > 0 && <Text dimColor>after {waiting.join(', ')}</Text>
-                  )}
+              <Box
+                key={`test-${t.id}`}
+                flexDirection="column"
+                gap={1}
+                {...(isRunning ? { borderStyle: 'round', borderColor: wait ? 'warning' : 'claude', paddingX: 1 } : {})}
+              >
+                <Box justifyContent="space-between" columnGap={1}>
+                  <Box flexShrink={1}>
+                    <Button
+                      key={`test-${t.id}-row`}
+                      plain
+                      label={`${isOpen ? '▾' : '▸'} ${ICON[t.status]} ${t.id} ${t.title}`}
+                      onPress={() => setTestsView($, old => ({ ...old, expanded: isOpen ? null : t.id }))}
+                    >
+                      <Text color={STATUS_COLOR[t.status]}>{`${isOpen ? '▾' : '▸'} ${ICON[t.status]} ${t.id} `}</Text>
+                      <Text bold={isRunning}>{clip(t.title, width - 24)}</Text>
+                    </Button>
+                  </Box>
+                  {status}
                 </Box>
+                {wait && waitCard(wait)}
                 {isOpen && (
                   <Box marginLeft={2} flexDirection="column">
-                    {t.status === 'running' && <Text color="claude">● tester running</Text>}
                     {t.watch && <Text dimColor>watch: {t.watch}</Text>}
                     {t.steps.map((s, i) => (
-                      <Box key={`test-${t.id}-step-${i}`}>
-                        <Text dimColor={wait?.step !== null && wait?.step !== undefined && wait.step !== i + 1}>{`${i + 1}. `}</Text>
-                        <Text bold={wait?.step === i + 1}>{s}</Text>
+                      <Box key={`test-${t.id}-step-${i}`} flexDirection="column">
+                        <Box>
+                          <Text dimColor={wait?.step !== null && wait?.step !== undefined && wait.step !== i + 1}>{`${i + 1}. `}</Text>
+                          <Text bold={wait?.step === i + 1}>{s}</Text>
+                        </Box>
+                        {copies(`test-${t.id}-step-${i}`, s)}
                       </Box>
                     ))}
                     {t.expect && <Text dimColor>expect: {t.expect}</Text>}
@@ -1768,10 +1878,7 @@ export const register: Register = (on, options) => {
                     <Box columnGap={1} flexWrap="wrap">
                       <Button key={`test-${t.id}-pass`} label="Pass" onPress={() => markTest($, t, 'passed', typed(t.id))} />
                       <Button key={`test-${t.id}-fail`} label="Fail" onPress={() => markTest($, t, 'failed', typed(t.id))} />
-                      {t.status !== 'running' && waiting.length > 0 && <Text dimColor>waits on {waiting.join(', ')}</Text>}
-                      {t.status !== 'running' && waiting.length === 0 && (
-                        <Button key={`test-${t.id}-start`} variant="primary" label={t.log.length > 0 ? 'Restart tester' : 'Start tester'} onPress={() => startTester($, t)} />
-                      )}
+                      {!isRunning && waiting.length > 0 && <Text dimColor>waits on {waiting.join(', ')}</Text>}
                     </Box>
                   </Box>
                 )}

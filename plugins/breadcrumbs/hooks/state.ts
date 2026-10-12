@@ -20,5 +20,8 @@ export const normalize = (value: Partial<Crumbs> | null | undefined): Crumbs => 
     touched: list(c.touched),
     repos: list(c.repos),
     asking: c.asking ?? null,
+    outbox: list(c.outbox),
+    asked: list(c.asked),
+    isWorking: c.isWorking === true,
   }
 }

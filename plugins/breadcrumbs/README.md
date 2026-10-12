@@ -1,12 +1,20 @@
 # breadcrumbs
 
-A Claude Code mod that keeps a pane beside the session with what it's about, so you can switch worktrees and pick up where you left off.
+A Claude Code mod that keeps a pane beside the session. Claude talks to you through it without stopping, and you can switch worktrees and pick up where you left off.
 
-- **Task**: the session's goal, kept current by a cheap side pass after each turn
-- **Needs you**: questions and decisions Claude left for you, and any question it's waiting on now
+- **Task**: the session's goal, kept current by a cheap side pass (Haiku) after each turn
+- **Needs you**: questions Claude went on without, each with what it assumed meanwhile, and any question it's waiting on now
 - **You asked / Claude**: your last prompt, what Claude is running and the start of its last reply
-- **Notes**: explanations and summaries you asked for, saved as Markdown and previewable in the pane (Pin keeps one for good)
+- **Notes**: explanations from Claude's replies, filed by the side pass, plus what Claude posts on purpose (a finding mid-turn, a plan or handoff it keeps current). Saved as Markdown and previewable in the pane; Pin keeps one for good
 - **Decided / Tried**: choices Claude made on its own, and approaches it tried (✗ marks a dead end)
+
+## Questions that don't stop Claude
+
+Claude uses its own ask dialog only when it can't go on without you. Otherwise it writes `Open question: Which TTL? [5m | 1h] (assuming 5m)` and keeps working on the assumption. The question shows in the pane as soon as Claude writes it. You answer with a button or a typed reply whenever you like, and no new turn starts:
+
+- while Claude works, the answer reaches it after its next tool call;
+- while it's idle, the answer goes with your next prompt, or right away with **send now**;
+- **fine as is** keeps the assumption and tells Claude nothing.
 
 Mods need Claude Code 2.1.287 or later.
 
@@ -15,13 +23,16 @@ Mods need Claude Code 2.1.287 or later.
 ```
 /plugin marketplace add crockalet/claude-mods
 /plugin install breadcrumbs@claude-mods
+/plugin install breadcrumbs-launcher@claude-mods
 ```
 
 `/whereami` shows or hides the pane. It opens by itself at 144+ columns.
 
 ## Manual tests
 
-When you need to run tests by hand, Claude lists them in a second pane (`/tests`) with their steps. **Start tester** hands one test to a tester subagent that walks you through it, follows the logs while you go, and sends its final report to the main session, so the main agent stays the orchestrator.
+When you need to run tests by hand, Claude lists them in a second pane (`/tests`) with their steps, adding each as soon as the piece it covers is ready, so they wait there until you get to them. **Start tester** hands one test to a tester subagent that walks you through it, follows the logs while you go, and sends its final report to the main session, so the main agent stays the orchestrator.
+
+With [breadcrumbs-launcher](../breadcrumbs-launcher) installed, Start launches the tester at once, even mid-turn. Without it, Start asks Claude to spawn the tester, which waits until Claude is free. (An agent a mod spawns skips that mod's own hooks, so breadcrumbs can't answer its own tester's tools. A second mod's spawn doesn't have that problem.)
 
 - Claude plans like a planner: a shared brief every tester trusts, tests grouped by physical setup, and the remaining tests revised (or marked blocked) after each report.
 - Each test names its trigger (the code that makes the expected signal happen), what it assumes, and which tests it needs first. A test waits on those and is blocked when one fails.
@@ -29,6 +40,9 @@ When you need to run tests by hand, Claude lists them in a second pane (`/tests`
 - A tester hands you a run of steps at once and stops only at checkpoints. Its questions come with their own answer buttons; plain steps get Done / Can't. You can always type a reply, and the status line counts what's waiting.
 - Feedback typed on a test goes to the step it's waiting on, else its running tester, else Claude.
 - A bare Pass costs no turn; it rides along with your next prompt.
+- Each test starts from its row (**▶ start**), and a step the tester is waiting on shows under the test's title, open or not. Running tests sit at the top, framed.
+- **■ stop** ends a running tester at once, and Pass or Fail on a running test settles it the same way: its waiting step returns, and every later tool call is refused but a cleanup kill and the tester's hand-back, so it reports and ends.
+- A command or text to paste in a step gets a copy button.
 
 ## Files
 

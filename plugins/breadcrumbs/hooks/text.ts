@@ -108,18 +108,20 @@ export const strings = (value: unknown, max: number, each = 100): string[] =>
 const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 // Older state.json files stored needs-you items as bare strings.
-type RawAsk = { question: string; context?: unknown; options?: unknown; optionNotes?: unknown }
+type RawAsk = { question: string; context?: unknown; options?: unknown; optionNotes?: unknown; assumption?: unknown }
 type RawOption = { label: string; description?: unknown }
 
 const text = (value: unknown, max: number) => (typeof value === 'string' ? clip(value, max) : '')
 
+export const MAX_ASKS = 6
+
 // Accepts every shape this has had: bare strings, string options, and {label, description} options.
-export const asks = (value: unknown): { question: string; context: string; options: string[]; optionNotes: string[] }[] =>
+export const asks = (value: unknown): { question: string; context: string; options: string[]; optionNotes: string[]; assumption: string }[] =>
   Array.isArray(value)
     ? value
         .map(v => (typeof v === 'string' ? { question: v } : v))
         .filter((v): v is RawAsk => typeof v?.question === 'string' && v.question.trim() !== '')
-        .slice(0, 4)
+        .slice(-MAX_ASKS)
         .map(v => {
           const notes = Array.isArray(v.optionNotes) ? v.optionNotes : []
           const options = (Array.isArray(v.options) ? v.options : [])
@@ -133,9 +135,31 @@ export const asks = (value: unknown): { question: string; context: string; optio
             context: text(v.context, 400),
             options: options.map(o => clip(o.label, 80)),
             optionNotes: options.map(o => text(o.description, 160)),
+            assumption: text(v.assumption, 160),
           }
         })
     : []
+
+const OPEN = /^\s*(?:[-*>]\s+)?(?:\*\*|__)?open question\b(?:\*\*|__)?\s*:(?:\*\*|__)?\s*(.+)$/i
+
+// `Open question: Which TTL? [5m | 1h] (assuming 5m)`, options and assumption both optional.
+export const openQuestions = (reply: string) => {
+  let isFenced = false
+  return asks(
+    reply.split('\n').flatMap(line => {
+      if (/^\s*(```|~~~)/.test(line)) isFenced = !isFenced
+      const body = isFenced ? undefined : OPEN.exec(line)?.[1]
+      if (!body) return []
+      let rest = body.replace(/\*\*|__/g, '').trim()
+      const assumed = /\(\s*assum(?:e|es|ing)\s*:?\s*(.+?)\s*\)\s*\.?$/i.exec(rest)
+      if (assumed) rest = rest.slice(0, assumed.index).trim()
+      const choices = /\[([^\]]*\|[^\]]*)\]\s*$/.exec(rest)
+      if (choices) rest = rest.slice(0, choices.index).trim()
+      const options = choices?.[1]?.split('|').map(o => o.trim()).filter(Boolean) ?? []
+      return rest ? [{ question: rest, options, assumption: assumed?.[1] ?? '' }] : []
+    }),
+  )
+}
 
 export const DONE_TITLE = 40
 

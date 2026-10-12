@@ -10,7 +10,11 @@ export type Task = { title: string; at: number }
 
 export type Attempt = { text: string; isOk: boolean }
 
-export type Ask = { question: string; context: string; options: string[]; optionNotes: string[] }
+// What Claude went ahead with while the question waits; '' when it named nothing.
+export type Ask = { question: string; context: string; options: string[]; optionNotes: string[]; assumption: string }
+
+// An answer from the pane that Claude has not read yet.
+export type Answer = { question: string; answer: string; at: number }
 
 export type Repo = {
   root: string
@@ -40,6 +44,10 @@ export type Crumbs = {
   touched: string[]
   repos: Repo[]
   asking: string | null
+  outbox: Answer[]
+  // Open questions already shown, so one repeated in a later reply isn't asked again.
+  asked: string[]
+  isWorking: boolean
 }
 
 export type Where = {
@@ -54,10 +62,7 @@ export type View = {
   isShowingMore: boolean
   isShowingStatus: boolean
   openDone: number | null
-  picked: Record<string, string>
   typed: Record<string, string>
-  details: Record<string, string>
-  expanded: string | null
 }
 
 export type TestStatus = 'todo' | 'running' | 'passed' | 'failed' | 'blocked' | 'retest'
